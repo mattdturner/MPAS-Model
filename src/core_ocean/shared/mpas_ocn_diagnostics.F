@@ -187,7 +187,7 @@ contains
              kineticEnergyCell, tangentialVelocity)
 
 #ifdef MPAS_OPENACC
-      !$acc update host(tangentialVelocity, relativeVorticityCell, kineticEnergyCell, &
+      !$acc update host(tangentialVelocity, relativeVorticityCell, &
       !$acc             divergence, vertVelocityTop, vertTransportVelocityTop, &
       !$acc             vertGMBolusVelocityTop, relativeVorticity, circulation)
 #endif
@@ -197,8 +197,11 @@ contains
       !
       if ( ke_vertex_flag == 1 ) then
          call ocn_diagnostic_solve_kineticEnergy(normalVelocity, kineticEnergyCell)
-         !$acc update device(kineticEnergyCell)
       end if
+
+#ifdef MPAS_OPENACC
+      !$acc update host(kineticEnergyCell)
+#endif
 
       call ocn_diagnostic_solve_vorticity(dt, normalVelocity, tangentialVelocity, &
                 layerThickness, relativeVorticity, &
@@ -395,21 +398,46 @@ contains
       !
       !-----------------------------------------------------------------
 
-      integer :: iVertex, iEdge, i, k
+      integer :: iVertex, iEdge, i, k, kmin, kmax
 
       real (kind=RKIND) :: invAreaTri1, r_tmp
 
       err = 0
 
 #ifdef MPAS_OPENACC
-      !$acc parallel loop gang vector &
+      kmin = minval(minLevelVertexTop)
+      kmax = maxval(maxLevelVertexBot)
+      !$acc parallel loop gang vector collapse(2) &
+      !$acc          present(circulation, relativeVorticity) &
+      !$acc          private(k)
+      do iVertex = 1, nVerticesAll
+         do k = 1, nVertLevels
+            circulation(k, iVertex) = 0.0_RKIND
+            relativeVorticity(k, iVertex) = 0.0_RKIND
+         end do
+      end do
+
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(circulation, relativeVorticity, areaTriangle, edgesOnVertex, &
       !$acc                  maxLevelVertexBot, dcEdge, normalVelocity, edgeSignOnVertex) &
       !$acc          private(invAreaTri1, i, iEdge, k, r_tmp)
+      do iVertex = 1, nVerticesAll
+         do k = kmin, kmax
+            if ( k >= minLevelVertexTop(iVertex) .and. k <= maxLevelVertexBot(iVertex) ) then
+               invAreaTri1 = 1.0_RKIND / areaTriangle(iVertex)
+               do i = 1, vertexDegree
+                  iEdge = edgesOnVertex(i, iVertex)
+                  r_tmp = dcEdge(iEdge) * normalVelocity(k, iEdge)
+ 
+                  circulation(k, iVertex) = circulation(k, iVertex) + edgeSignOnVertex(i, iVertex) * r_tmp
+                  relativeVorticity(k, iVertex) = relativeVorticity(k, iVertex) + edgeSignOnVertex(i, iVertex) * r_tmp * invAreaTri1
+               end do
+            end if
+         end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(invAreaTri1, i, iEdge, k, r_tmp)
-#endif
       do iVertex = 1, nVerticesAll
          circulation(:, iVertex) = 0.0_RKIND
          relativeVorticity(:, iVertex) = 0.0_RKIND
@@ -424,7 +452,6 @@ contains
             end do
          end do
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -572,6 +599,8 @@ contains
 
       integer :: iVertex, i, iEdge, k, j, nCells, nVertices, iCell
       real (kind=RKIND) :: r_tmp, invAreaCell1
+      real (kind=RKIND), parameter :: fiveEighths = 5.0_RKIND / 8.0_RKIND
+      real (kind=RKIND), parameter :: threeEighths = 3.0_RKIND / 8.0_RKIND
 
       ! Scratch Arrays
       ! kineticEnergyVertex: kinetic energy of horizontal velocity defined at vertices
@@ -587,6 +616,25 @@ contains
       allocate(kineticEnergyVertex(nVertLevels, nVertices), &
                kineticEnergyVertexOnCells(nVertLevels, nCells))
 
+#ifdef MPAS_OPENACC
+      !$acc enter data create(kineticEnergyVertex, kineticEnergyVertexOnCells) 
+
+      !$acc parallel loop gang vector collapse(2) &
+      !$acc          present(kineticEnergyVertex, edgesOnVertex, dcEdge, dvEdge, &
+      !$acc                  areaTriangle, normalVelocity) &
+      !$acc          private(i, iEdge, r_tmp, k)
+      do iVertex = 1, nVertices
+        do k = 1, nVertLevels
+          kineticEnergyVertex(k, iVertex) = 0.0_RKIND
+          do i = 1, vertexDegree
+            iEdge = edgesOnVertex(i, iVertex)
+            r_tmp = dcEdge(iEdge) * dvEdge(iEdge) * 0.25_RKIND / areaTriangle(iVertex)
+            kineticEnergyVertex(k, iVertex) = kineticEnergyVertex(k, iVertex) + r_tmp &
+                                            * normalVelocity(k, iEdge)**2
+          end do
+        end do
+      end do
+#else
       !$omp parallel
       !$omp do schedule(runtime) private(i, iEdge, r_tmp, k)
       do iVertex = 1, nVertices
@@ -600,7 +648,28 @@ contains
         end do
       end do
       !$omp end do
+#endif
 
+#ifdef MPAS_OPENACC
+      !$acc parallel loop gang vector collapse(2) &
+      !$acc          present(kineticEnergyVertexOnCells, invAreaCell, nEdgesOnCell, &
+      !$acc                  kiteIndexOnCell, verticesOnCell, kiteAreasOnVertex, &
+      !$acc                  kineticEnergyVertex) &
+      !$acc          private(invAreaCell1, i, j, iVertex, k)
+      do iCell = 1, nCells
+        do k = 1, nVertLevels
+          kineticEnergyVertexOnCells(k, iCell) = 0.0_RKIND
+          invAreaCell1 = invAreaCell(iCell)
+          do i = 1, nEdgesOnCell(iCell)
+            j = kiteIndexOnCell(i, iCell)
+            iVertex = verticesOnCell(i, iCell)
+            kineticEnergyVertexOnCells(k, iCell) = kineticEnergyVertexOnCells(k, iCell) &
+                                                 + kiteAreasOnVertex(j, iVertex) &
+                                                 * kineticEnergyVertex(k, iVertex) * invAreaCell1
+          end do
+        end do
+      end do
+#else
       !$omp do schedule(runtime) private(invAreaCell1, i, j, iVertex, k)
       do iCell = 1, nCells
         kineticEnergyVertexOnCells(:, iCell) = 0.0_RKIND
@@ -615,19 +684,30 @@ contains
         end do
       end do
       !$omp end do
+#endif
 
       !
       ! Compute kinetic energy in each cell by blending kineticEnergyCell and kineticEnergyVertexOnCells
       !
+#ifdef MPAS_OPENACC
+      !$acc parallel loop gang vector collapse(2) &
+      !$acc          present(kineticEnergyCell, kineticEnergyVertexOnCells) &
+      !$acc          private(k)
+#else
       !$omp do schedule(runtime) private(k)
+#endif
       do iCell = 1, nCells
          do k = 1, nVertLevels
-            kineticEnergyCell(k,iCell) = 5.0_RKIND / 8.0_RKIND * kineticEnergyCell(k,iCell) + 3.0_RKIND / 8.0_RKIND &
+            kineticEnergyCell(k,iCell) = fiveEighths * kineticEnergyCell(k,iCell) + threeEighths &
                                        * kineticEnergyVertexOnCells(k,iCell)
          end do
       end do
+#ifdef MPAS_OPENACC
+      !$acc exit data delete(kineticEnergyVertexOnCells, kineticEnergyVertex)
+#else
       !$omp end do
       !$omp end parallel
+#endif
 
       deallocate(kineticEnergyVertex, &
                  kineticEnergyVertexOnCells)
@@ -692,6 +772,7 @@ contains
       integer :: vertex1, vertex2, cell1, cell2
       real(kind=RKIND) :: invAreaTri1, invAreaCell1, invLength
       real(kind=RKIND) :: layerThicknessVertex
+      integer :: kmin, kmax
 
       ! normalizedPlanetaryVorticityVertex: earth's rotational rate (Coriolis parameter, f)
       !                                     divided by layer thickness, defined at vertices
@@ -719,19 +800,36 @@ contains
       nVertices = nVerticesHalo( 2 )
 
 #ifdef MPAS_OPENACC
+      kmax = maxval(maxLevelVertexBot(:))
       !$acc enter data create(normalizedRelativeVorticityVertex, &
       !$acc                   normalizedPlanetaryVorticityVertex)
-      !$acc parallel loop gang vector &
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(areaTriangle, maxLevelVertexBot, &
       !$acc                  layerThickness, kiteAreasOnVertex, &
       !$acc                  relativeVorticity, fVertex, &
       !$acc                  normalizedRelativeVorticityVertex, &
       !$acc                  normalizedPlanetaryVorticityVertex) &
       !$acc          private(invAreaTri1, layerThicknessVertex, k, i)
+      do iVertex = 1, nVertices
+         do k = 1, kmax
+            if ( k <= maxLevelVertexBot(iVertex)) then
+               invAreaTri1 = 1.0_RKIND / areaTriangle(iVertex)
+               layerThicknessVertex = 0.0_RKIND
+               do i = 1, vertexDegree
+                  layerThicknessVertex = layerThicknessVertex + layerThickness(k,cellsOnVertex(i,iVertex)) &
+                                       * kiteAreasOnVertex(i,iVertex)
+               end do
+               layerThicknessVertex = layerThicknessVertex * invAreaTri1
+               if (layerThicknessVertex == 0) cycle
+   
+               normalizedRelativeVorticityVertex(k,iVertex) = relativeVorticity(k,iVertex) / layerThicknessVertex
+               normalizedPlanetaryVorticityVertex(k,iVertex) = fVertex(iVertex) / layerThicknessVertex
+            end if
+         end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(invAreaTri1, k, layerThicknessVertex, i)
-#endif
       do iVertex = 1, nVertices
          invAreaTri1 = 1.0_RKIND / areaTriangle(iVertex)
          do k = 1, maxLevelVertexBot(iVertex)
@@ -747,7 +845,6 @@ contains
             normalizedPlanetaryVorticityVertex(k,iVertex) = fVertex(iVertex) / layerThicknessVertex
          end do
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -755,17 +852,34 @@ contains
       nEdges = nEdgesHalo( 2 )
 
 #ifdef MPAS_OPENACC
-      !$acc parallel loop gang vector &
+      kmin = maxval(minLevelEdgeTop(:))
+      kmax = maxval(maxLevelEdgeBot(:))
+
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(normalizedRelativeVorticityEdge, &
       !$acc                  normalizedPlanetaryVorticityEdge, &
       !$acc                  verticesOnEdge, maxLevelEdgeBot, &
       !$acc                  normalizedRelativeVorticityVertex, &
       !$acc                  normalizedPlanetaryVorticityVertex) &
       !$acc          private(vertex1, vertex2, k)
+      do iEdge = 1, nEdges
+        do k = kmin, kmax
+          normalizedRelativeVorticityEdge(k, iEdge) = 0.0_RKIND
+          normalizedPlanetaryVorticityEdge(k, iEdge) = 0.0_RKIND
+
+          if ( k >= minLevelEdgeTop(iEdge) .and. k <= maxLevelEdgeBot(iEdge) ) then
+            vertex1 = verticesOnEdge(1, iEdge)
+            vertex2 = verticesOnEdge(2, iEdge)
+            normalizedRelativeVorticityEdge(k, iEdge) = 0.5_RKIND * (normalizedRelativeVorticityVertex(k, vertex1) &
+                                                      + normalizedRelativeVorticityVertex(k, vertex2))
+            normalizedPlanetaryVorticityEdge(k, iEdge) = 0.5_RKIND * (normalizedPlanetaryVorticityVertex(k, vertex1) &
+                                                       + normalizedPlanetaryVorticityVertex(k, vertex2))
+          end if
+        end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(vertex1, vertex2, k)
-#endif
       do iEdge = 1, nEdges
         normalizedRelativeVorticityEdge(:, iEdge) = 0.0_RKIND
         normalizedPlanetaryVorticityEdge(:, iEdge) = 0.0_RKIND
@@ -778,7 +892,6 @@ contains
                                                      + normalizedPlanetaryVorticityVertex(k, vertex2))
         end do
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -786,15 +899,32 @@ contains
       nCells = nCellsHalo ( 1 )
 
 #ifdef MPAS_OPENACC
+      kmin = maxval(minLevelCell(:))
+      kmax = maxval(maxLevelCell(:))
+
       !$acc parallel loop gang vector &
       !$acc          present(normalizedRelativeVorticityCell, maxLevelCell, nEdgesOnCell, &
       !$acc                  areaCell, kiteIndexOnCell, verticesOnCell, kiteAreasOnVertex, &
       !$acc                  invAreaCell) &
       !$acc          private(invAreaCell1, i, j, iVertex, k)
+      do iCell = 1, nCells
+        do k = kmin, kmax
+          normalizedRelativeVorticityCell(k, iCell) = 0.0_RKIND
+          if ( k >= minLevelCell(iCell) .and. k <=  maxLevelCell(iCell) ) then
+            invAreaCell1 = invAreaCell(iCell)
+
+            do i = 1, nEdgesOnCell(iCell)
+              j = kiteIndexOnCell(i, iCell)
+              iVertex = verticesOnCell(i, iCell)
+              normalizedRelativeVorticityCell(k, iCell) = normalizedRelativeVorticityCell(k, iCell) &
+                + kiteAreasOnVertex(j, iVertex) * normalizedRelativeVorticityVertex(k, iVertex) * invAreaCell1
+            end do
+          end if
+        end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(invAreaCell1, i, j, iVertex, k)
-#endif
       do iCell = 1, nCells
         normalizedRelativeVorticityCell(:, iCell) = 0.0_RKIND
         invAreaCell1 = invAreaCell(iCell)
@@ -808,7 +938,6 @@ contains
           end do
         end do
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -941,19 +1070,34 @@ contains
       integer :: iCell, k, i, iEdge
       integer :: nCells
       real(kind=RKIND) :: invAreaCell1
+      integer :: kmin, kmax
 
       !
       ! Brunt-Vaisala frequency (this has units of s^{-2})
       !
       coef = -gravity / rho_sw
 #ifdef MPAS_OPENACC
-      !$acc parallel loop gang vector &
+      kmin = minval(minLevelCell)
+      kmax = maxval(maxLevelCell)
+
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(BruntVaisalaFreqTop, displacedDensity, density, zMid, maxLevelCell) &
       !$acc          private(k)
+      do iCell = 1, nCellsAll
+         do k = kmin, kmax
+           if ( k >= minLevelCell(iCell) .and. k <= maxLevelCell(iCell) ) then
+             if ( k == minLevelCell(iCell) ) then
+               BruntVaisalaFreqTop(minLevelCell(iCell), iCell) = 0.0_RKIND
+             else
+               BruntVaisalaFreqTop(k,iCell) = coef * (displacedDensity(k-1,iCell) - density(k,iCell)) &
+                 / (zMid(k-1,iCell) - zMid(k,iCell))
+             end if
+           end if
+         end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(k)
-#endif
       do iCell = 1, nCellsAll
          BruntVaisalaFreqTop(minLevelCell(iCell),iCell) = 0.0_RKIND
          do k = minLevelCell(iCell)+1, maxLevelCell(iCell)
@@ -961,7 +1105,6 @@ contains
               / (zMid(k-1,iCell) - zMid(k,iCell))
           end do
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -972,15 +1115,36 @@ contains
 
       nCells = nCellsHalo( 2 )
 #ifdef MPAS_OPENACC
+      kmin = minval(minLevelCell)
+      kmax = maxval(maxLevelCell)
       !$acc update device(edgeAreaFractionOfCell)
-      !$acc parallel loop gang vector &
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(RiTopOfCell, maxLevelCell, nEdgesOnCell, edgesOnCell, normalVelocity, &
       !$acc                  edgeAreaFractionOfCell, zMid, BruntVaisalaFreqTop) &
       !$acc          private(k, i, iEdge, delU2, shearSquared, shearMean)
+      do iCell=1,nCells
+         do k = kmin, kmax
+           RiTopOfCell(k,iCell) = 100.0_RKIND
+           if ( k >= minLevelCell(iCell)+1 .and. k <= maxLevelCell(iCell) ) then
+             shearSquared = 0.0_RKIND
+             do i = 1, nEdgesOnCell(iCell)
+               iEdge = edgesOnCell(i, iCell)
+               delU2 = (normalVelocity(k-1,iEdge) - normalVelocity(k,iEdge))**2
+               shearSquared = shearSquared + edgeAreaFractionOfCell(i,iCell) * delU2
+             enddo
+             ! Note that the factor of two is from averaging dot product to cell center on a C-grid
+             shearMean = sqrt(2.0_RKIND*shearSquared )
+             shearMean = shearMean / (zMid(k-1,iCell) - zMid(k,iCell))
+             RiTopOfCell(k,iCell) = BruntVaisalaFreqTop(k,iCell) / (shearMean**2 + 1.0e-10_RKIND)
+             if ( k == minLevelCell(iCell)+1 ) then
+               RiTopOfCell(minLevelCell(iCell),iCell) = RiTopOfCell(minLevelCell(iCell)+1,iCell)
+             end if
+           end if
+         end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(k, shearSquared, i, iEdge, delU2, shearMean)
-#endif
       do iCell=1,nCells
          RiTopOfCell(:,iCell) = 100.0_RKIND
          do k = minLevelCell(iCell)+1, maxLevelCell(iCell)
@@ -997,7 +1161,6 @@ contains
           end do
           RiTopOfCell(minLevelCell(iCell),iCell) = RiTopOfCell(minLevelCell(iCell)+1,iCell)
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -1072,6 +1235,7 @@ contains
       integer :: cell1, cell2
       real(kind=RKIND) :: surfaceLayerDepth
       real(kind=RKIND) :: sumSurfaceLayer
+      integer :: kmin, kmax
 
       !
       ! average tracer values over the ocean surface layer
@@ -1081,14 +1245,46 @@ contains
         nCells = nCellsOwned
         surfaceLayerDepth = config_cvmix_kpp_surface_layer_averaging
 #ifdef MPAS_OPENACC
+        kmin = minval(minLevelCell)
+        kmax = maxval(maxLevelCell)
+
         !$acc parallel loop gang vector &
         !$acc          present(tracersSurfaceLayerValue, indexSurfaceLayerDepth, maxLevelCell, &
         !$acc                  layerThickness, activeTracers) &
         !$acc          private(sumSurfaceLayer, k, rSurfaceLayer)
+        do iCell=1,nCells
+          sumSurfaceLayer=0.0_RKIND
+          tracersSurfaceLayerValue(:,iCell) = 0.0_RKIND
+          indexSurfaceLayerDepth(iCell) = -9.e30
+          do k = kmin, kmax
+           if ( k >= minLevelCell(iCell) .and. k <=  maxLevelCell(iCell)) then
+             sumSurfaceLayer = sumSurfaceLayer + layerThickness(k,iCell)
+             rSurfaceLayer = maxLevelCell(iCell)
+             if(sumSurfaceLayer.gt.surfaceLayerDepth) then
+               sumSurfaceLayer = sumSurfaceLayer - layerThickness(k,iCell)
+               rSurfaceLayer = int(k-1) + (surfaceLayerDepth-sumSurfaceLayer) &
+                             / layerThickness(k,iCell)
+               indexSurfaceLayerDepth(iCell) = rSurfaceLayer
+               exit
+             end if
+           end if
+          end do
+          tracersSurfaceLayerValue(:, iCell) = 0.0_RKIND
+          do k=1,int(rSurfaceLayer)
+            tracersSurfaceLayerValue(:,iCell) = tracersSurfaceLayerValue(:,iCell) &
+                                              + activeTracers(:,k,iCell) &
+                                              * layerThickness(k,iCell)
+          enddo
+          k=min( int(rSurfaceLayer)+1, maxLevelCell(iCell) )
+          tracersSurfaceLayerValue(:,iCell) = (tracersSurfaceLayerValue(:,iCell) &
+                                            + fraction(rSurfaceLayer) &
+                                            * activeTracers(:,k,iCell) &
+                                            * layerThickness(k,iCell)) &
+                                            / surfaceLayerDepth
+        enddo
 #else
         !$omp parallel
         !$omp do schedule(runtime) private(sumSurfaceLayer, k, rSurfaceLayer)
-#endif
         do iCell=1,nCells
           sumSurfaceLayer=0.0_RKIND
           tracersSurfaceLayerValue(:,iCell) = 0.0_RKIND
@@ -1098,21 +1294,25 @@ contains
            rSurfaceLayer = maxLevelCell(iCell)
            if(sumSurfaceLayer.gt.surfaceLayerDepth) then
              sumSurfaceLayer = sumSurfaceLayer - layerThickness(k,iCell)
-             rSurfaceLayer = int(k-1) + (surfaceLayerDepth-sumSurfaceLayer)/layerThickness(k,iCell)
+             rSurfaceLayer = int(k-1) + (surfaceLayerDepth-sumSurfaceLayer) &
+                           / layerThickness(k,iCell)
              indexSurfaceLayerDepth(iCell) = rSurfaceLayer
              exit
            endif
           end do
           tracersSurfaceLayerValue(:, iCell) = 0.0_RKIND
           do k=1,int(rSurfaceLayer)
-            tracersSurfaceLayerValue(:,iCell) = tracersSurfaceLayerValue(:,iCell) + activeTracers(:,k,iCell) &
+            tracersSurfaceLayerValue(:,iCell) = tracersSurfaceLayerValue(:,iCell) &
+                                              + activeTracers(:,k,iCell) &
                                               * layerThickness(k,iCell)
           enddo
           k=min( int(rSurfaceLayer)+1, maxLevelCell(iCell) )
-          tracersSurfaceLayerValue(:,iCell) = (tracersSurfaceLayerValue(:,iCell) + fraction(rSurfaceLayer) &
-                                            * activeTracers(:,k,iCell) * layerThickness(k,iCell)) / surfaceLayerDepth
+          tracersSurfaceLayerValue(:,iCell) = (tracersSurfaceLayerValue(:,iCell) &
+                                            + fraction(rSurfaceLayer) &
+                                            * activeTracers(:,k,iCell) &
+                                            * layerThickness(k,iCell)) &
+                                            / surfaceLayerDepth
         enddo
-#ifndef MPAS_OPENACC
         !$omp end do
         !$omp end parallel
 #endif
@@ -1249,24 +1449,47 @@ contains
       integer :: iCell, iVertex, iEdge
       integer :: i, j, k
       integer :: edgeSignOnCell_temp, eoe
+      integer :: kmin, kmax
       real(kind=RKIND) :: invAreaCell1
       real(kind=RKIND) :: dcEdge_temp, dvEdge_temp, r_tmp, weightsOnEdge_temp
 
+#ifdef MPAS_OPENACC
+      real (kind=RKIND), dimension(:,:), allocatable:: div_hu,div_huTransport,div_huGMBolus
+#else
       real (kind=RKIND), dimension(:), allocatable:: div_hu,div_huTransport,div_huGMBolus
+#endif
 
       ! Need owned cells for relativeVorticityCell
       nCells = nCellsOwned
 
 #ifdef MPAS_OPENACC
-      !$acc parallel loop gang vector &
+      kmin = minval(minLevelCell)
+      kmax = maxval(maxLevelCell)
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(relativeVorticityCell, areaCell, nEdgesOnCell, &
       !$acc                  kiteIndexOnCell, verticesOnCell, maxLevelCell, &
       !$acc                  relativeVorticity, kiteAreasOnVertex, invAreaCell) &
       !$acc          private(invAreaCell1, i, j, iVertex, k)
+      do iCell = 1, nCells
+        do k = kmin, kmax
+          relativeVorticityCell(k,iCell) = 0.0_RKIND
+          if ( k >= minLevelCell(iCell) .and. k <= maxLevelCell(iCell) ) then
+            invAreaCell1 = invAreaCell(iCell)
+
+            do i = 1, nEdgesOnCell(iCell)
+              j = kiteIndexOnCell(i, iCell)
+              iVertex = verticesOnCell(i, iCell)
+              relativeVorticityCell(k, iCell) = relativeVorticityCell(k, iCell) &
+                                              + kiteAreasOnVertex(j, iVertex) &
+                                              * relativeVorticity(k, iVertex) &
+                                              * invAreaCell1
+            end do
+          end if
+        end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(invAreaCell1, i, j, k, iVertex)
-#endif
       do iCell = 1, nCells
         relativeVorticityCell(:,iCell) = 0.0_RKIND
         invAreaCell1 = invAreaCell(iCell)
@@ -1280,7 +1503,6 @@ contains
           end do
         end do
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -1291,24 +1513,88 @@ contains
       !
       ! Compute divergence, kinetic energy, and vertical velocity
       !
-      allocate(div_hu(nVertLevels),div_huTransport(nVertLevels),div_huGMBolus(nVertLevels))
-
 #ifdef MPAS_OPENACC
+      allocate(div_hu(nVertLevels, nCells), &
+               div_huTransport(nVertLevels, nCells), &
+               div_huGMBolus(nVertLevels, nCells))
+
+      kmin = minval(minLevelCell)
+      kmax = maxval(maxLevelCell)
+
       !$acc enter data create(div_hu, div_huTransport, div_huGMBolus)
-      !$acc parallel loop gang vector &
+      !$acc parallel loop gang vector collapse(2) &
+      !$acc          present(div_hu,div_huTransport,div_huGMBolus)
+      do iCell = 1, nCells
+         do k = 1,nVertLevels
+            div_hu(k,iCell) = 0.0_RKIND
+            div_huTransport(k,iCell) = 0.0_RKIND
+            div_huGMBolus(k,iCell) = 0.0_RKIND
+         end do
+      end do
+
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(divergence, kineticEnergyCell, div_hu, div_huTransport, div_huGMBolus, &
       !$acc                  areaCell, nEdgesOnCell, edgesOnCell, edgeSignOnCell, dcEdge, dvEdge, &
       !$acc                  maxLevelCell, normalVelocity, divergence, layerThicknessEdge, &
-      !$acc                  normalTransportVelocity, normalGMBolusVelocity, vertVelocityTop, &
-      !$acc                  vertTransportVelocityTop, vertGMBolusVelocityTop, invAreaCell) &
+      !$acc                  normalTransportVelocity, normalGMBolusVelocity, &
+      !$acc                  invAreaCell) &
       !$acc          private(invAreaCell1, i, iEdge, edgeSignOnCell_temp, dcEdge_temp, &
       !$acc                  dvEdge_temp, k, r_tmp)
+      do iCell = 1, nCells
+         do k = kmin, kmax
+            divergence(k, iCell) = 0.0_RKIND
+            kineticEnergyCell(k, iCell) = 0.0_RKIND
+            if ( k >= minLevelCell(iCell) .and. k <=  maxLevelCell(iCell) ) then
+               invAreaCell1 = invAreaCell(iCell)
+               do i = 1, nEdgesOnCell(iCell)
+                  iEdge = edgesOnCell(i, iCell)
+                  edgeSignOnCell_temp = edgeSignOnCell(i, iCell)
+                  dcEdge_temp = dcEdge(iEdge)
+                  dvEdge_temp = dvEdge(iEdge)
+                  r_tmp = dvEdge_temp * normalVelocity(k, iEdge) * invAreaCell1
+
+                  divergence(k, iCell) = divergence(k, iCell) - edgeSignOnCell_temp * r_tmp
+                  div_hu(k, iCell) = div_hu(k, iCell) - layerThicknessEdge(k, iEdge) &
+                                   * edgeSignOnCell_temp * r_tmp
+                  kineticEnergyCell(k, iCell) = kineticEnergyCell(k, iCell) &
+                                                + 0.25 * r_tmp * dcEdge_temp * normalVelocity(k,iEdge)
+                  ! Compute vertical velocity from the horizontal total transport
+                  div_huTransport(k, iCell) = div_huTransport(k, iCell) &
+                                     - layerThicknessEdge(k, iEdge) * edgeSignOnCell_temp &
+                                     * dvEdge_temp * normalTransportVelocity(k, iEdge) * invAreaCell1
+                  ! Compute vertical velocity from the horizontal GM Bolus velocity
+                  div_huGMBolus(k, iCell) = div_huGMBolus(k, iCell) &
+                                   - layerThicknessEdge(k, iEdge) * edgeSignOnCell_temp * dvEdge_temp &
+                                   * normalGMBolusVelocity(k, iEdge) * invAreaCell1
+               end do
+            end if
+         end do
+      end do
+
+      !$acc parallel loop gang &
+      !$acc          present(vertVelocityTop,vertTransportVelocityTop,vertGMBolusVelocityTop, &
+      !$acc                  maxLevelCell,div_hu,div_huTransport,div_huGMBolus) &
+      !$acc          private(k)
+      do iCell = 1, nCells
+         ! Vertical velocity at bottom (maxLevelCell(iCell)+1) is zero, initialized above.
+         vertVelocityTop(1:minLevelCell(iCell)-1, iCell) = 0.0_RKIND
+         vertVelocityTop(maxLevelCell(iCell)+1, iCell) = 0.0_RKIND
+         do k = maxLevelCell(iCell), 1, -1
+            vertVelocityTop(k,iCell) = vertVelocityTop(k+1,iCell) - div_hu(k, iCell)
+            vertTransportVelocityTop(k,iCell) = vertTransportVelocityTop(k+1,iCell) &
+                                              - div_huTransport(k, iCell)
+            vertGMBolusVelocityTop(k,iCell) = vertGMBolusVelocityTop(k+1,iCell) &
+                                            - div_huGMBolus(k, iCell)
+         end do
+      end do
+      !$acc exit data delete(div_hu, div_huTransport, div_huGMBolus)
 #else
+      allocate(div_hu(nVertLevels),div_huTransport(nVertLevels),div_huGMBolus(nVertLevels))
+
       !$omp parallel
       !$omp do schedule(runtime) &
       !$omp private(i, iEdge, invAreaCell1, edgeSignOnCell_temp, dcEdge_temp, dvEdge_temp, &
       !$omp         k, r_tmp, div_hu, div_huTransport, div_huGMBolus)
-#endif
       do iCell = 1, nCells
          divergence(:, iCell) = 0.0_RKIND
          kineticEnergyCell(:, iCell) = 0.0_RKIND
@@ -1347,9 +1633,6 @@ contains
             vertGMBolusVelocityTop(k,iCell) = vertGMBolusVelocityTop(k+1,iCell) - div_huGMBolus(k)
          end do
       end do
-#ifdef MPAS_OPENACC
-      !$acc exit data delete(div_hu, div_huTransport, div_huGMBolus)
-#else
       !$omp end do
       !$omp end parallel
 #endif
@@ -1358,14 +1641,29 @@ contains
 
       nEdges = nEdgesHalo( 2 )
 #ifdef MPAS_OPENACC
-      !$acc parallel loop gang vector &
+      kmin = minval(minLevelEdgeBot)
+      kmax = maxval(maxLevelEdgeBot)
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(tangentialVelocity, nEdgesOnEdge, edgesOnEdge, weightsOnEdge, &
       !$acc                  maxLevelEdgeTop, normalVelocity) &
       !$acc          private(i, eoe, weightsOnEdge_temp, k)
+      do iEdge = 1, nEdges
+         do k = kmin, kmax
+            tangentialVelocity(k, iEdge) = 0.0_RKIND
+            if ( k >= minLevelEdgeBot(iEdge) .and. k <= maxLevelEdgeTop(iEdge) ) then
+               ! Compute v (tangential) velocities
+               do i = 1, nEdgesOnEdge(iEdge)
+                  eoe = edgesOnEdge(i,iEdge)
+                  weightsOnEdge_temp = weightsOnEdge(i, iEdge)
+                  tangentialVelocity(k,iEdge) = tangentialVelocity(k,iEdge) &
+                                              + weightsOnEdge_temp * normalVelocity(k, eoe)
+               end do
+            end if
+         end do
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(i, eoe, weightsOnEdge_temp, k)
-#endif
       do iEdge = 1, nEdges
          tangentialVelocity(:, iEdge) = 0.0_RKIND
          ! Compute v (tangential) velocities
@@ -1378,7 +1676,6 @@ contains
             end do
          end do
       end do
-#ifndef MPAS_OPENACC
       !$omp end do
       !$omp end parallel
 #endif
@@ -1507,17 +1804,46 @@ contains
       integer :: nCells
       integer :: iCell
       integer :: k
+      integer :: idx
 
       nCells = nCellsAll
 
 #ifdef MPAS_OPENACC
-      !$acc parallel loop gang vector &
-      !$acc          present(maxLevelCell, zMid, layerThickness, zTop, bottomDepth, ssh) &
-      !$acc          private(k)
+      !$acc parallel loop gang vector collapse(2) &
+      !$acc          present(maxLevelCell, zMid, layerThickness, zTop, bottomDepth) &
+      !$acc          private(k, idx)
+      do iCell = 1, nCells
+         ! Compute zMid, the z-coordinate of the middle of the layer.
+         ! Compute zTop, the z-coordinate of the top of the layer.
+         ! Note the negative sign, since bottomDepth is positive
+         ! and z-coordinates are negative below the surface.
+         do k = 1, nVertLevels
+            if ( k >= maxLevelCell(iCell) ) then
+               idx = maxLevelCell(iCell)
+               zMid(k,iCell) = -bottomDepth(iCell) + 0.5_RKIND*layerThickness(idx,iCell)
+               zTop(k,iCell) = -bottomDepth(iCell) + layerThickness(idx,iCell)
+            end if
+         end do
+      end do
+
+      !$acc parallel loop &
+      !$acc          present(minLevelCell, maxLevelCell, zMid, layerThickness, zTop, ssh) &
+      !$acc          private(k, idx)
+      do iCell = 1, nCells
+         do k = maxLevelCell(iCell)-1, minLevelCell(iCell), -1
+            zMid(k,iCell) = zMid(k+1,iCell)  &
+              + 0.5_RKIND*(  layerThickness(k+1,iCell) &
+                           + layerThickness(k  ,iCell))
+            zTop(k,iCell) = zTop(k+1,iCell)  &
+              + layerThickness(k  ,iCell)
+         end do
+
+         ! copy zTop(1,iCell) into sea-surface height array
+         ssh(iCell) = zTop(minLevelCell(iCell),iCell)
+      end do
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(k)
-#endif
       do iCell = 1, nCells
 
          ! Compute zMid, the z-coordinate of the middle of the layer.
@@ -1542,6 +1868,7 @@ contains
       end do
       !$omp end do
       !$omp end parallel
+#endif
 
    end subroutine ocn_diagnostic_solve_z_coordinates!}}}
 
@@ -1954,6 +2281,7 @@ contains
       real (kind=RKIND), dimension(:,:), pointer :: normalVelocity, normalBaroclinicVelocity
 
       integer :: timeLevel
+      integer :: kmin, kmax
 
       if (present(timeLevelIn)) then
          timeLevel = timeLevelIn
@@ -1974,14 +2302,33 @@ contains
 #ifdef MPAS_OPENACC
       !$acc enter data create(normalVelocity) copyin(normalBaroclinicVelocity)
 
-      !$acc parallel loop gang vector &
+      kmin = minval(minLevelEdgeBot)
+      kmax = maxval(maxLevelEdgeBot)
+
+      !$acc parallel loop gang vector collapse(2) &
       !$acc          present(cellsOnEdge, maxLevelEdgeTop, normalVelocity, nEdgesOnEdge, &
       !$acc                  edgesOnEdge, weightsOnEdge, fEdge, normalBaroclinicVelocity) &
       !$acc          private(cell1, cell2, k, j, eoe)
+      do iEdge = 1, nEdgesOwned
+         do k = kmin, kmax
+            if ( k >= minLevelEdgeBot(iEdge) .and. k <=  maxLevelEdgeTop(iEdge) ) then
+               cell1 = cellsOnEdge(1,iEdge)
+               cell2 = cellsOnEdge(2,iEdge)
+
+               normalVelocity(k,iEdge) = 0.0_RKIND
+               do j = 1,nEdgesOnEdge(iEdge)
+                  eoe = edgesOnEdge(j,iEdge)
+                  normalVelocity(k,iEdge) = normalVelocity(k,iEdge) + weightsOnEdge(j,iEdge) &
+                                          * normalBaroclinicVelocity(k,eoe) &
+                                          * fEdge(eoe)
+               end do
+            end if 
+         end do
+      end do
+      !$acc exit data copyout(normalVelocity) delete(normalBaroclinicVelocity)
 #else
       !$omp parallel
       !$omp do schedule(runtime) private(cell1, cell2, k, eoe)
-#endif
       do iEdge = 1, nEdgesOwned
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
@@ -1996,9 +2343,6 @@ contains
             end do
          end do
       end do
-#ifdef MPAS_OPENACC
-      !$acc exit data copyout(normalVelocity) delete(normalBaroclinicVelocity)
-#else
       !$omp end do
       !$omp end parallel
 #endif
