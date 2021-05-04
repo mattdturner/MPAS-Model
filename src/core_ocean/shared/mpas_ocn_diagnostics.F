@@ -104,7 +104,7 @@ contains
       integer, intent(in), optional :: timeLevelIn !< Input: Time level in state
       logical, intent(in), optional :: full   !< Input: Run all computations?
 
-      integer :: iEdge, iCell
+      integer :: iEdge, iCell, k
       integer :: err, nCells, nEdges, nVertices
 
       real (kind=RKIND) :: coef_3rd_order
@@ -150,33 +150,31 @@ contains
       nCells = nCellsAll
       nVertices = nVerticesAll
 
-      call ocn_diagnostic_solve_layerThicknessEdge(normalVelocity, layerThickness, layerThickEdge)
-
-#ifdef MPAS_OPENACC
-      !$acc update device(layerThickEdge)
-#endif
-
-      coef_3rd_order = config_coef_3rd_order
-
-      !
-      ! TODO: Move this and the data transfers up right after
-      !       allocates and before any calls
-      ! set the velocity and height at dummy address
-      !    used -1e34 so error clearly occurs if these values are used.
-      !
-
-      normalVelocity(:,nEdges+1) = -1e34
-      layerThickness(:,nCells+1) = -1e34
-      activeTracers(indexTemperature,:,nCells+1) = -1e34
-      activeTracers(indexSalinity,:,nCells+1) = -1e34
-
-#ifdef MPAS_OPENACC
+      ! Transfer data to GPU device
       !$acc enter data copyin (layerThickness, normalVelocity, &
       !$acc                    activeTracers, ssh, seaIcePressure, &
-      !$acc                    atmosphericPressure)
+      !$acc                    atmosphericPressure, indexTemperature, &
+      !$acc                    indexSalinity)
       !$acc update device (normalTransportVelocity, &
       !$acc                normalGMBolusVelocity)
-#endif
+
+      ! set the velocity and height at dummy address
+      !    used -1e34 so error clearly occurs if these values are used.
+      !$acc parallel loop &
+      !$acc          present(normalVelocity, layerThickness, activeTracers, &
+      !$acc                  indexTemperature, indexSalinity)
+      !$omp parallel 
+      !$omp do schedule(runtime)
+      do k = 1, nVertLevels
+         normalVelocity(k,nEdges+1) = -1e34
+         layerThickness(k,nCells+1) = -1e34
+         activeTracers(indexTemperature,k,nCells+1) = -1e34
+         activeTracers(indexSalinity,k,nCells+1) = -1e34
+      end do
+
+      call ocn_diagnostic_solve_layerThicknessEdge(normalVelocity, layerThickness, layerThickEdge)
+
+      coef_3rd_order = config_coef_3rd_order
 
       call ocn_relativeVorticity_circulation(relativeVorticity, circulation, normalVelocity, err)
 
@@ -186,12 +184,6 @@ contains
              vertGMBolusVelocityTop, relativeVorticityCell, divergence, &
              kineticEnergyCell, tangentialVelocity)
 
-#ifdef MPAS_OPENACC
-      !$acc update host(tangentialVelocity, relativeVorticityCell, &
-      !$acc             divergence, vertVelocityTop, vertTransportVelocityTop, &
-      !$acc             vertGMBolusVelocityTop, relativeVorticity, circulation)
-#endif
-
       !
       ! Compute kinetic energy
       !
@@ -199,19 +191,12 @@ contains
          call ocn_diagnostic_solve_kineticEnergy(normalVelocity, kineticEnergyCell)
       end if
 
-#ifdef MPAS_OPENACC
       !$acc update host(kineticEnergyCell)
-#endif
 
       call ocn_diagnostic_solve_vorticity(dt, normalVelocity, tangentialVelocity, &
                 layerThickness, relativeVorticity, &
                 normRelVortEdge, normPlanetVortEdge, &
                 normalizedRelativeVorticityCell)
-
-#ifdef MPAS_OPENACC
-      !$acc update self(normRelVortEdge, normPlanetVortEdge, &
-      !$acc             normalizedRelativeVorticityCell)
-#endif
 
       !
       ! Surface pressure
@@ -220,19 +205,11 @@ contains
       call ocn_diagnostic_solve_surface_pressure(forcingPool, atmosphericPressure, &
                 seaIcePressure, surfacePressure)
 
-#ifdef MPAS_OPENACC
-      !$acc update device(surfacePressure)
-#endif
-
       !
       ! Z-coordinates
       ! This section must be placed in the code before computing the density.
       !
       call ocn_diagnostic_solve_z_coordinates(layerThickness, zMid, zTop, ssh)
-
-#ifdef MPAS_OPENACC
-      !$acc update host(zMid, zTop, ssh)
-#endif
 
       !
       ! equation of state
@@ -240,6 +217,9 @@ contains
 
       ! Only need densities on 0, 1, and 2 halo cells
       nCells = nCellsAll
+
+      ! Update host arrays used in the CPU-only portions of equation of state
+      !$acc update host(activeTracers)
 
       ! compute in-place density
       call ocn_equation_of_state_density(statePool, meshPool, tracersSurfaceValue, &
@@ -265,8 +245,6 @@ contains
       call ocn_diagnostic_solve_pressure(layerThickness, density, &
                 surfacePressure, montgomeryPotential, pressure)
 
-      !$acc update device (montgomeryPotential, pressure)
-
       nCells = nCellsAll
 
       if ( full_compute ) then
@@ -276,10 +254,7 @@ contains
          !
          call ocn_diagnostic_solve_richardson(displacedDensity, density, zMid, &
                 normalVelocity, edgeAreaFractionOfCell, BruntVaisalaFreqTop, RiTopOfCell)
-
-#ifdef MPAS_OPENACC
          !$acc update host(RiTopOfCell, BruntVaisalaFreqTop)
-#endif
 
       end if    ! full_compute
 
@@ -298,21 +273,14 @@ contains
       !$omp end do
       !$acc update device (tracersSurfaceValue)
 
-#ifdef MPAS_OPENACC
       !$acc parallel loop gang vector &
       !$acc          present(normalVelocity, normalVelocitySurfaceLayer)
-#else
       !$omp do schedule(runtime)
-#endif
       do iEdge = 1, nEdges
          normalVelocitySurfaceLayer(iEdge) = normalVelocity(minLevelEdgeBot(iEdge), iEdge)
       end do
-#ifdef MPAS_OPENACC
-      !$acc update host(normalVelocitySurfaceLayer)
-#else
       !$omp end do
       !$omp end parallel
-#endif
 
       if ( full_compute ) then
 
@@ -324,18 +292,20 @@ contains
                 indexSurfaceLayerDepth, normalVelocitySurfaceLayer, &
                 sfcFlxAttCoeff, surfaceFluxAttenuationCoefficientRunoff)
 
-#ifdef MPAS_OPENACC
          !$acc update host(tracersSurfaceLayerValue, &
          !$acc             indexSurfaceLayerDepth, &
-         !$acc             normalVelocitySurfaceLayer)
-         !$acc update device (sfcFlxAttCoeff, &
-         !$acc                surfaceFluxAttenuationCoefficientRunoff)
-#endif
+         !$acc             normalVelocitySurfaceLayer, &
+         !$acc             sfcFlxAttCoeff, &
+         !$acc             surfaceFluxAttenuationCoefficientRunoff)
 
       end if ! full_compute
 
+      ! the following arrays are used in ocn_compute_land_ice_flux_input_fields,
+      ! which has yet to be ported to GPUs.
+      !$acc update host(normalVelocity, layerThickness)
       !
       !  compute fields needed to compute land-ice fluxes, either in the ocean model or in the coupler
+      ! TODO: debug, mdt :: port this to GPUs using a test case that has land_ice_flux_mode enabled
       call ocn_compute_land_ice_flux_input_fields(meshPool, statePool, forcingPool, scratchPool, &
                                          timeLevel)
 
@@ -343,9 +313,18 @@ contains
 
          call ocn_diagnostic_solve_ssh(forcingPool, ssh, seaIcePressure, pressureAdjustedSSH, &
                 gradSSH)
-         !$acc update device(pressureAdjustedSSH, gradSSH)
+         !$acc update host(pressureAdjustedSSH, gradSSH)
 
       end if ! full_compute
+
+      ! Update the arrays on CPU that were calculated in this routine
+      !$acc update host(layerThickEdge, layerThickness, zMid, zTop, ssh, &
+      !$acc             normalVelocitySurfaceLayer, montgomeryPotential, &
+      !$acc             tangentialVelocity, relativeVorticityCell, &
+      !$acc             divergence, vertVelocityTop, vertTransportVelocityTop, &
+      !$acc             vertGMBolusVelocityTop, relativeVorticity, circulation, &
+      !$acc             normRelVortEdge, normPlanetVortEdge, pressure, &
+      !$acc             normalizedRelativeVorticityCell, surfacePressure)
 
       !$acc exit data delete (layerThickness, normalVelocity, &
       !$acc                   activeTracers, ssh, seaIcePressure, &
@@ -511,7 +490,12 @@ contains
 
       nEdges = nEdgesAll
 
-      if (.not. config_use_wetting_drying .or. (config_use_wetting_drying .and. (trim(config_thickness_flux_type) .eq. 'centered'))) then
+      if (.not. config_use_wetting_drying .or. (config_use_wetting_drying &
+          .and. (trim(config_thickness_flux_type) .eq. 'centered'))) then
+        !$acc parallel loop gang &
+        !$acc          present(layerThicknessEdge, cellsOnEdge, minLevelEdgeBot, &
+        !$acc                  maxLevelEdgeTop, layerThickness) &
+        !$acc          private(cell1, cell2, k)
         !$omp parallel
         !$omp do schedule(runtime) private(cell1, cell2, k)
         do iEdge = 1, nEdges
@@ -529,6 +513,10 @@ contains
       else
         if (config_use_wetting_drying .and. (trim(config_thickness_flux_type) .ne. 'centered')) then
           if ( trim(config_thickness_flux_type) .eq. 'upwind') then
+            !$acc parallel loop gang &
+            !$acc          present(layerThicknessEdge, cellsOnEdge, minLevelEdgeBot, &
+            !$acc                  maxLevelEdgeTop, layerThickness, normalVelocity) &
+            !$acc          private(cell1, cell2, k)
             !$omp parallel
             !$omp do schedule(runtime) private(cell1, cell2, k)
             do iEdge = 1, nEdges
@@ -689,26 +677,20 @@ contains
       !
       ! Compute kinetic energy in each cell by blending kineticEnergyCell and kineticEnergyVertexOnCells
       !
-#ifdef MPAS_OPENACC
       !$acc parallel loop gang vector collapse(2) &
       !$acc          present(kineticEnergyCell, kineticEnergyVertexOnCells) &
       !$acc          private(k)
-#else
       !$omp do schedule(runtime) private(k)
-#endif
       do iCell = 1, nCells
          do k = 1, nVertLevels
             kineticEnergyCell(k,iCell) = fiveEighths * kineticEnergyCell(k,iCell) + threeEighths &
                                        * kineticEnergyVertexOnCells(k,iCell)
          end do
       end do
-#ifdef MPAS_OPENACC
-      !$acc exit data delete(kineticEnergyVertexOnCells, kineticEnergyVertex)
-#else
       !$omp end do
       !$omp end parallel
-#endif
 
+      !$acc exit data delete(kineticEnergyVertexOnCells, kineticEnergyVertex)
       deallocate(kineticEnergyVertex, &
                  kineticEnergyVertexOnCells)
 
@@ -954,10 +936,16 @@ contains
 
          nEdges = nEdgesHalo( 1 )
 
-         !$acc update self(normalizedRelativeVorticityCell, &
-         !$acc             normalizedRelativeVorticityVertex, &
-         !$acc             normalizedRelativeVorticityEdge)
+         !$acc enter data create(vorticityGradientNormalComponent, &
+         !$acc                   vorticityGradientTangentialComponent)
 
+         !$acc parallel loop gang &
+         !$acc          present(cellsOnEdge, verticesOnEdge, dcEdge, minLevelEdgeBot, &
+         !$acc                  maxLevelEdgeTop, vorticityGradientNormalComponent, &
+         !$acc                  normalizedRelativeVorticityCell, dvEdge, &
+         !$acc                  vorticityGradientTangentialComponent, &
+         !$acc                  normalizedRelativeVorticityVertex) &
+         !$acc          private(cell1, cell2, vertex1, vertex2, invLength, k)
          !$omp parallel
          !$omp do schedule(runtime) private(cell1, cell2, vertex1, vertex2, invLength, k)
          do iEdge = 1,nEdges
@@ -971,7 +959,8 @@ contains
             !   ( this computes the gradient for all edges bounding real cells )
             do k = minLevelEdgeBot(iEdge), maxLevelEdgeTop(iEdge)
                vorticityGradientNormalComponent(k,iEdge) = &
-                  (normalizedRelativeVorticityCell(k,cell2) - normalizedRelativeVorticityCell(k,cell1)) * invLength
+                      (normalizedRelativeVorticityCell(k,cell2) &
+                     - normalizedRelativeVorticityCell(k,cell1)) * invLength
             enddo
 
             invLength = 1.0_RKIND / dvEdge(iEdge)
@@ -979,7 +968,8 @@ contains
             !   ( this computes the gradient at all edges bounding real cells and distance-1 ghost cells )
             do k = minLevelEdgeTop(iEdge), maxLevelEdgeBot(iEdge)
               vorticityGradientTangentialComponent(k,iEdge) = &
-                 (normalizedRelativeVorticityVertex(k,vertex2) - normalizedRelativeVorticityVertex(k,vertex1)) * invLength
+                     (normalizedRelativeVorticityVertex(k,vertex2) &
+                    - normalizedRelativeVorticityVertex(k,vertex1)) * invLength
             enddo
 
          enddo
@@ -988,6 +978,12 @@ contains
          !
          ! Modify PV edge with upstream bias.
          !
+         !$acc parallel loop gang &
+         !$acc          present(minLevelEdgeTop, maxLevelEdgeBot, normalVelocity, &
+         !$acc                  normalizedRelativeVorticityEdge, tangentialVelocity, &
+         !$acc                  vorticityGradientNormalComponent, config_apvm_scale_factor, &
+         !$acc                  vorticityGradientTangentialComponent) &
+         !$acc          private(k)
          !$omp do schedule(runtime) private(k)
          do iEdge = 1,nEdges
             do k = minLevelEdgeTop(iEdge), maxLevelEdgeBot(iEdge)
@@ -997,11 +993,12 @@ contains
                      + tangentialVelocity(k,iEdge) * vorticityGradientTangentialComponent(k,iEdge) )
             end do
          enddo
+         !$acc update host(normalizedRelativeVorticityVertex)
          !$omp end do
          !$omp end parallel
 
-         !$acc update device(normalizedRelativeVorticityEdge)
-
+         !$acc exit data delete(vorticityGradientNormalComponent, &
+         !$acc                  vorticityGradientTangentialComponent)
          deallocate(vorticityGradientNormalComponent, &
                     vorticityGradientTangentialComponent)
 
@@ -1165,9 +1162,7 @@ contains
       !$omp end parallel
 #endif
 
-#ifdef MPAS_OPENACC
       !$acc update host(BruntVaisalaFreqTop)
-#endif
 
    end subroutine ocn_diagnostic_solve_richardson!}}}
 
@@ -1325,51 +1320,59 @@ contains
         !
 
         surfaceLayerDepth = config_cvmix_kpp_surface_layer_averaging
-#ifdef MPAS_OPENACC
+
         !$acc parallel loop gang vector &
         !$acc          present(normalVelocitySurfaceLayer, cellsOnEdge, maxLevelEdgeTop, &
         !$acc                  layerThicknessEdge, normalVelocity) &
         !$acc          private(cell1, cell2, rSurfaceLayer, sumSurfaceLayer, k)
-#else
         !$omp parallel
         !$omp do schedule(runtime) private(cell1, cell2, sumSurfaceLayer, k, rSurfaceLayer)
-#endif
         do iEdge=1,nEdges
-          normalVelocitySurfaceLayer(iEdge) = 0.0_RKIND
-          cell1=cellsOnEdge(1,iEdge)
-          cell2=cellsOnEdge(2,iEdge)
-          sumSurfaceLayer=0.0_RKIND
-          rSurfaceLayer = min(minLevelEdgeBot(iEdge), maxLevelEdgeTop(iEdge))
-          do k = minLevelEdgeBot(iEdge), maxLevelEdgeTop(iEdge)
-           rSurfaceLayer = k
-           sumSurfaceLayer = sumSurfaceLayer + layerThicknessEdge(k,iEdge)
-           if(sumSurfaceLayer.gt.surfaceLayerDepth) then
-             sumSurfaceLayer = sumSurfaceLayer - layerThicknessEdge(k,iEdge)
-             rSurfaceLayer = int(k-1) + (surfaceLayerDepth-sumSurfaceLayer)/layerThicknessEdge(k,iEdge)
-             exit
-           endif
-          end do
-          normalVelocitySurfaceLayer(iEdge) = 0.0_RKIND
-          do k = minLevelEdgeBot(iEdge),int(rSurfaceLayer)
-            normalVelocitySurfaceLayer(iEdge) = normalVelocitySurfaceLayer(iEdge) + normalVelocity(k,iEdge) &
-                                              * layerThicknessEdge(k,iEdge)
-          end do
-          k=int(rSurfaceLayer)+1
-          if(k.le.maxLevelEdgeTop(iEdge)) then
-            normalVelocitySurfaceLayer(iEdge) = (normalVelocitySurfaceLayer(iEdge) + fraction(rSurfaceLayer) &
-                                              * normalVelocity(k,iEdge) * layerThicknessEdge(k,iEdge)) / surfaceLayerDepth
-          end if
+           normalVelocitySurfaceLayer(iEdge) = 0.0_RKIND
+           cell1=cellsOnEdge(1,iEdge)
+           cell2=cellsOnEdge(2,iEdge)
+           sumSurfaceLayer=0.0_RKIND
+           rSurfaceLayer = min(minLevelEdgeBot(iEdge), maxLevelEdgeTop(iEdge))
+           do k = minLevelEdgeBot(iEdge), maxLevelEdgeTop(iEdge)
+              rSurfaceLayer = k
+              sumSurfaceLayer = sumSurfaceLayer + layerThicknessEdge(k,iEdge)
+              if(sumSurfaceLayer.gt.surfaceLayerDepth) then
+                 sumSurfaceLayer = sumSurfaceLayer - layerThicknessEdge(k,iEdge)
+                 rSurfaceLayer = int(k-1) + (surfaceLayerDepth-sumSurfaceLayer) &
+                               / layerThicknessEdge(k,iEdge)
+                 exit
+              endif
+           end do
+           normalVelocitySurfaceLayer(iEdge) = 0.0_RKIND
+           do k = minLevelEdgeBot(iEdge),int(rSurfaceLayer)
+              normalVelocitySurfaceLayer(iEdge) = normalVelocitySurfaceLayer(iEdge) &
+                                                + normalVelocity(k,iEdge) &
+                                                * layerThicknessEdge(k,iEdge)
+           end do
+           k=int(rSurfaceLayer)+1
+           if(k.le.maxLevelEdgeTop(iEdge)) then
+              normalVelocitySurfaceLayer(iEdge) = (normalVelocitySurfaceLayer(iEdge) &
+                                                + fraction(rSurfaceLayer) &
+                                                * normalVelocity(k,iEdge) &
+                                                * layerThicknessEdge(k,iEdge)) &
+                                                / surfaceLayerDepth
+           end if
         enddo
-#ifndef MPAS_OPENACC
         !$omp end do
         !$omp end parallel
-#endif
 
       endif
 
       nCells = nCellsHalo( 1 )
 
       ! compute the attenuation coefficient for surface fluxes
+      !$acc enter data copyin(config_flux_attenuation_coefficient, &
+      !$acc                   config_flux_attenuation_coefficient_runoff)
+      !$acc parallel loop gang &
+      !$acc          present(surfaceFluxAttenuationCoefficient, &
+      !$acc                  surfaceFluxAttenuationCoefficientRunoff, &
+      !$acc                  config_flux_attenuation_coefficient, &
+      !$acc                  config_flux_attenuation_coefficient_runoff)
       !$omp parallel
       !$omp do schedule(runtime)
       do iCell = 1, nCells
@@ -1640,6 +1643,7 @@ contains
       deallocate(div_hu,div_huTransport,div_huGMBolus)
 
       nEdges = nEdgesHalo( 2 )
+
 #ifdef MPAS_OPENACC
       kmin = minval(minLevelEdgeBot)
       kmax = maxval(maxLevelEdgeBot)
@@ -1740,6 +1744,9 @@ contains
 
       nCells = nCellsAll
 
+      !$acc parallel loop gang &
+      !$acc          present(surfacePressure, atmosphericPressure, seaIcePressure, &
+      !$acc                  frazilSurfacePressure, landIcePressure)
       !$omp parallel
       !$omp do schedule(runtime)
       do iCell = 1, nCells
@@ -1938,6 +1945,12 @@ contains
 
         allocate(pTop(nVertLevels))
 
+        !$acc enter data create(pTop)
+
+        !$acc parallel loop gang &
+        !$acc          present(pTop, montgomeryPotential, minLevelCell, bottomDepth, &
+        !$acc                  layerThickness, density) &
+        !$acc          private(k)
         !$omp parallel
         !$omp do schedule(runtime) private(pTop, k)
         do iCell = 1, nCells
@@ -1961,10 +1974,15 @@ contains
         !$omp end do
         !$omp end parallel
 
+        !$acc exit data delete(pTop)
         deallocate(pTop)
 
       else
 
+        !$acc parallel loop gang &
+        !$acc          present(pressure, minLevelCell, surfacePressure, density, &
+        !$acc                  layerThickness, maxLevelCell) &
+        !$acc          private(k)
         !$omp parallel
         !$omp do schedule(runtime) private(k)
         do iCell = 1, nCells
@@ -2040,6 +2058,8 @@ contains
       call mpas_pool_get_array(forcingPool, 'landIceDraft', landIceDraft)
 
       nCells = nCellsHalo( 1 )
+      !$acc parallel loop gang &
+      !$acc          present(pressureAdjustedSSH, ssh, seaIcePressure)
       !$omp parallel
       !$omp do schedule(runtime)
       do iCell = 1, nCells
@@ -2049,6 +2069,8 @@ contains
       !$omp end parallel
 
       if(associated(landIceDraft)) then
+         !$acc parallel loop gang &
+         !$acc          present(pressureAdjustedSSH, landIceDraft)
          !$omp parallel
          !$omp do schedule(runtime)
          do iCell = 1, nCells
@@ -2062,6 +2084,9 @@ contains
 
       nEdges = nEdgesHalo( 1 )
 
+      !$acc parallel loop gang &
+      !$acc          present(cellsOnEdge, gradSSH, edgeMask, pressureAdjustedSSH, dcEdge) &
+      !$acc          private(cell1, cell2)
       !$omp parallel
       !$omp do schedule(runtime) private(cell1, cell2)
       do iEdge = 1, nEdges
@@ -2173,7 +2198,6 @@ contains
       ! thickness-weighted divergence and barotropic divergence
       !
       ! See Ringler et al. (2010) jcp paper, eqn 19, 21, and fig. 3.
-#ifdef MPAS_OPENACC
       !$acc enter data create(div_hu, projectedSSH, ALE_Thickness)
 
       !$acc parallel loop &
@@ -2181,10 +2205,8 @@ contains
       !$acc                  layerThicknessEdge, normalVelocity, dvEdge, edgeSignOnCell, &
       !$acc                  oldSSH, projectedSSH) &
       !$acc          private(div_hu_btr, invAreaCell1, i, iEdge, flux, k, kmin, kmax)
-#else
       !$omp parallel
       !$omp do schedule(runtime) private(invAreaCell1, i, iEdge, k, flux, div_hu_btr, kmin, kmax)
-#endif
       do iCell = 1, nCells
          div_hu(:,iCell) = 0.0_RKIND
          div_hu_btr = 0.0_RKIND
@@ -2195,7 +2217,8 @@ contains
             kmax = maxLevelEdgeTop(iEdge)
 
             do k = kmin, kmax
-               flux = layerThicknessEdge(k, iEdge) * normalVelocity(k, iEdge) * dvEdge(iEdge) * edgeSignOnCell(i, iCell) &
+               flux = layerThicknessEdge(k, iEdge) * normalVelocity(k, iEdge) &
+                    * dvEdge(iEdge) * edgeSignOnCell(i, iCell) &
                     * invAreaCell1
                div_hu(k,iCell) = div_hu(k,iCell) - flux
                div_hu_btr = div_hu_btr - flux
@@ -2203,20 +2226,19 @@ contains
          end do
          projectedSSH(iCell) = oldSSH(iCell) - dt*div_hu_btr
       end do
-#ifdef MPAS_OPENACC
       !$acc update host(projectedSSH)
-#else
       !$omp end do
       !$omp end parallel
-#endif
 
       !
       ! Compute desired thickness at new time
       !
       if (present(newHighFreqThickness)) then
-        call ocn_ALE_thickness(meshPool, verticalMeshPool, projectedSSH, ALE_thickness, err, newHighFreqThickness)
+        call ocn_ALE_thickness(meshPool, verticalMeshPool, projectedSSH, &
+                               ALE_thickness, err, newHighFreqThickness)
       else
-        call ocn_ALE_thickness(meshPool, verticalMeshPool, projectedSSH, ALE_thickness, err)
+        call ocn_ALE_thickness(meshPool, verticalMeshPool, projectedSSH, &
+                               ALE_thickness, err)
       endif
 
       !
@@ -2226,18 +2248,14 @@ contains
       ! Here we are using solving the continuity equation for vertAleTransportTop ($w^t$),
       ! and using ALE_Thickness for thickness at the new time.
 
-#ifdef MPAS_OPENACC
-!      !$acc update device(div_hu, ALE_Thickness)
       !$acc update device(ALE_Thickness)
 
       !$acc parallel loop gang vector &
       !$acc          present(vertAleTransportTop, maxLevelCell, div_hu, ALE_Thickness, &
       !$acc                  oldLayerThickness) &
       !$acc          private(k)
-#else
       !$omp parallel
       !$omp do schedule(runtime) private(k)
-#endif
       do iCell = 1,nCells
          vertAleTransportTop(1,iCell) = 0.0_RKIND
          vertAleTransportTop(maxLevelCell(iCell)+1,iCell) = 0.0_RKIND
@@ -2246,13 +2264,10 @@ contains
               - (ALE_Thickness(k,iCell) - oldLayerThickness(k,iCell))/dt
          end do
       end do
-#ifdef MPAS_OPENACC
-      !$acc exit data delete(div_hu, projectedSSH, ALE_Thickness)
-#else
       !$omp end do
       !$omp end parallel
-#endif
 
+      !$acc exit data delete(div_hu, projectedSSH, ALE_Thickness)
       deallocate(div_hu, &
                  projectedSSH, &
                  ALE_Thickness)
@@ -2522,11 +2537,9 @@ contains
       ! Only need to compute over the 0 and 1 halos
       nCells = nCellsHalo( 2 )
 
-#ifdef MPAS_OPENACC
       !$acc enter data copyin(densitySurfaceDisplaced, &
       !$acc                   thermalExpansionCoeff,   &
       !$acc                   salineContractionCoeff)
-#endif
 
       ! compute EOS by displacing SST/SSS to every vertical layer in column
       call ocn_equation_of_state_density(statePool, meshPool, tracersSurfaceValue, &
@@ -2534,65 +2547,85 @@ contains
                                          err, thermalExpansionCoeff, salineContractionCoeff, &
                                          timeLevel)
 
-#ifdef MPAS_OPENACC
       !$acc exit data copyout(densitySurfaceDisplaced, &
       !$acc                   thermalExpansionCoeff,   &
       !$acc                   salineContractionCoeff)
-#endif
 
       !$omp parallel
       !$omp do schedule(runtime) &
       !$omp private(fracAbsorbed, fracAbsorbedRunoff, sumSurfaceStressSquared, i, iEdge)
       do iCell = 1, nCells
-         ! compute surface buoyancy forcing based on surface fluxes of mass, temperature, salinity and frazil
-         !                                (frazil to be added later)
-         ! since this computation is confusing, variables, units and sign convention is repeated here
-         ! everything below should be consistent with that specified in Registry
-         ! everything below should be consistent with the CVMix/KPP documentation:
+         ! compute surface buoyancy forcing based on surface fluxes of mass, 
+         ! temperature, salinity and frazil (frazil to be added later)
+         ! since this computation is confusing, variables, units and sign 
+         ! convention is repeated here everything below should be consistent 
+         ! with that specified in Registry everything below should be consistent 
+         ! with the CVMix/KPP documentation:
          !           https://www.dropbox.com/s/6hqgc0rsoa828nf/cvmix_20aug2013.pdf
          !
          !    surfaceThicknessFlux: surface mass flux, m/s, positive into ocean
-         !    activeTracersSurfaceFlux(indexTempFlux): non-penetrative temperature flux, C m/s, positive into ocean
-         !    penetrativeTemperatureFlux: penetrative surface temperature flux at ocean surface, positive into ocean
-         !    activeTracersSurfaceFlux(indexSaltFlux): salinity flux, PSU m/s, positive into ocean
-         !    penetrativeTemperatureFluxOBL: penetrative temperature flux computed at z=OBL, positive down
+         !    activeTracersSurfaceFlux(indexTempFlux): non-penetrative temperature 
+         !                                        flux, C m/s, positive into ocean
+         !    penetrativeTemperatureFlux: penetrative surface temperature flux at 
+         !                                     ocean surface, positive into ocean
+         !    activeTracersSurfaceFlux(indexSaltFlux): salinity flux, PSU m/s, 
+         !                                             positive into ocean
+         !    penetrativeTemperatureFluxOBL: penetrative temperature flux computed 
+         !                                   at z=OBL, positive down
          !
-         ! note: the following fields used the CVMix/KPP computation of buoyancy forcing are not included here
-         !    1. Tm: temperature associated with surfaceThicknessFlux, C  (here we assume Tm == temperatureSurfaceValue)
-         !    2. Sm: salinity associated with surfaceThicknessFlux, PSU (here we assume Sm == salinitySurfaceValue and account for
+         ! note: the following fields used the CVMix/KPP computation of buoyancy 
+         !       forcing are not included here
+         !    1. Tm: temperature associated with surfaceThicknessFlux, C  (here 
+         !           we assume Tm == temperatureSurfaceValue)
+         !    2. Sm: salinity associated with surfaceThicknessFlux, PSU (here 
+         !           we assume Sm == salinitySurfaceValue and account for
          !           salinity flux in activeTracersSurfaceFlux array)
          !
 
          ! Compute fraction of thickness flux that is in the top model layer
-         fracAbsorbed = 1.0_RKIND - exp( max(-layerThickness(1, iCell) / config_flux_attenuation_coefficient, -100.0_RKIND) )
-         fracAbsorbedRunoff = 1.0_RKIND - exp( max(-layerThickness(1, iCell) / config_flux_attenuation_coefficient_runoff, &
+         fracAbsorbed = 1.0_RKIND - exp( max(-layerThickness(1, iCell) &
+                      / config_flux_attenuation_coefficient, -100.0_RKIND) )
+         fracAbsorbedRunoff = 1.0_RKIND - exp( max(-layerThickness(1, iCell) &
+                            / config_flux_attenuation_coefficient_runoff, &
                               -100.0_RKIND) )
          ! Store the total tracer flux below in nonLocalSurfaceTemperatureFlux for use in the CVMix nonlocal
          ! transport code.  This includes tracer forcing due to thickness
 
-         nonLocalSurfaceTracerFlux(indexTempFlux, iCell) = activeTracersSurfaceFlux(indexTempFlux,iCell) &
-                 + penetrativeTemperatureFlux(iCell) - penetrativeTemperatureFluxOBL(iCell)  &
-                 - fracAbsorbed * (rainTemperatureFlux(iCell) + evapTemperatureFlux(iCell) + &
-                                   seaIceFreshWaterTemperatureFlux(iCell) + icebergFreshWaterTemperatureFlux(iCell)) &
-                 - fracAbsorbedRunoff * activeTracersSurfaceFluxRunoff(indexTempFlux, iCell)
+         nonLocalSurfaceTracerFlux(indexTempFlux, iCell) = &
+                   activeTracersSurfaceFlux(indexTempFlux,iCell) &
+                 + penetrativeTemperatureFlux(iCell) &
+                 - penetrativeTemperatureFluxOBL(iCell)  &
+                 - fracAbsorbed * (rainTemperatureFlux(iCell) &
+                                 + evapTemperatureFlux(iCell)  &
+                                 + seaIceFreshWaterTemperatureFlux(iCell) &
+                                 + icebergFreshWaterTemperatureFlux(iCell)) &
+                 - fracAbsorbedRunoff &
+                 * activeTracersSurfaceFluxRunoff(indexTempFlux, iCell)
 
-         nonLocalSurfaceTracerFlux(indexSaltFlux,iCell) = activeTracersSurfaceFlux(indexSaltFlux,iCell) &
-                 - fracAbsorbed * surfaceThicknessFlux(iCell) * activeTracers(indexSaltFlux,1,iCell) &
-                 - fracAbsorbedRunoff * surfaceThicknessFluxRunoff(iCell) * activeTracers(indexSaltFlux,1,iCell)
+         nonLocalSurfaceTracerFlux(indexSaltFlux,iCell) = &
+                   activeTracersSurfaceFlux(indexSaltFlux,iCell) &
+                 - fracAbsorbed * surfaceThicknessFlux(iCell) &
+                 * activeTracers(indexSaltFlux,1,iCell) &
+                 - fracAbsorbedRunoff * surfaceThicknessFluxRunoff(iCell) &
+                 * activeTracers(indexSaltFlux,1,iCell)
 
          surfaceBuoyancyForcing(iCell) =  thermalExpansionCoeff (1,iCell) &
                 * nonLocalSurfaceTracerFlux(indexTempFlux,iCell) &
-                - salineContractionCoeff(1,iCell) * nonLocalSurfaceTracerFlux(indexSaltFlux,iCell)
+                - salineContractionCoeff(1,iCell) &
+                * nonLocalSurfaceTracerFlux(indexSaltFlux,iCell)
 
          ! at this point, surfaceBuoyancyForcing has units of m/s
-         ! change into units of m^2/s^3 (which can be thought of as the flux of buoyancy, units of buoyancy * velocity )
+         ! change into units of m^2/s^3 (which can be thought of as 
+         ! the flux of buoyancy, units of buoyancy * velocity )
          surfaceBuoyancyForcing(iCell) = surfaceBuoyancyForcing(iCell) * gravity
 
          ! compute magnitude of surface stress
          sumSurfaceStressSquared = 0.0_RKIND
          do i = 1, nEdgesOnCell(iCell)
             iEdge = edgesOnCell(i, iCell)
-            sumSurfaceStressSquared = sumSurfaceStressSquared + edgeAreaFractionOfCell(i,iCell) * surfaceStress(iEdge)**2
+            sumSurfaceStressSquared = sumSurfaceStressSquared &
+                                    + edgeAreaFractionOfCell(i,iCell) &
+                                    * surfaceStress(iEdge)**2
          enddo
          ! NOTE that the factor of 2 is from averaging dot products to cell centers on a C-grid
          surfaceStressMagnitude(iCell) = sqrt(2.0_RKIND * sumSurfaceStressSquared)
@@ -2602,11 +2635,9 @@ contains
       !$omp end do
       !$omp end parallel
 
-#ifdef MPAS_OPENACC
       !$acc exit data delete(densitySurfaceDisplaced, &
       !$acc                   thermalExpansionCoeff,   &
       !$acc                   salineContractionCoeff)
-#endif
 
       ! deallocate scratch space
       deallocate(thermalExpansionCoeff, &
@@ -2616,7 +2647,6 @@ contains
       call mpas_timer_stop('KPP input fields')
 
     end subroutine ocn_compute_KPP_input_fields!}}}
-
 
 !***********************************************************************
 !
@@ -2652,7 +2682,8 @@ contains
 
       integer, pointer :: indexT, indexS
 
-      real (kind=RKIND) :: blThickness, dz, weightSum, h_nu, Gamma_turb, landIceEdgeFraction, velocityMagnitude
+      real (kind=RKIND) :: blThickness, dz, weightSum, h_nu, Gamma_turb
+      real (kind=RKIND) :: landIceEdgeFraction, velocityMagnitude
 
       real (kind=RKIND), dimension(:), pointer :: landIceFraction
 
@@ -2674,7 +2705,8 @@ contains
          xiN = 0.052_RKIND              ! dimensionless planetary boundary layer constant
 
 
-      if ( trim(config_land_ice_flux_mode) .ne. 'standalone' .and. trim(config_land_ice_flux_mode) .ne. 'coupled' ) then
+      if ( trim(config_land_ice_flux_mode) .ne. 'standalone' .and. &
+           trim(config_land_ice_flux_mode) .ne. 'coupled' ) then
          return
       end if
 
@@ -2696,13 +2728,16 @@ contains
 
       ! Compute top drag
       !$omp parallel
-      !$omp do schedule(runtime) private(cell1, cell2, velocityMagnitude, landIceEdgeFraction)
+      !$omp do schedule(runtime) &
+      !$omp    private(cell1, cell2, velocityMagnitude, landIceEdgeFraction)
       do iEdge = 1, nEdgesAll
          cell1 = cellsOnEdge(1, iEdge)
          cell2 = cellsOnEdge(2, iEdge)
 
-         ! top drag tau = - CD*|u|*u, where |u| = sqrt(2*KE) = sqrt(KE1 + KE2) from the neighboring cells
-         velocityMagnitude = sqrt(kineticEnergyCell(minLevelCell(cell1),cell1) + kineticEnergyCell(minLevelCell(cell2),cell2))
+         ! top drag tau = - CD*|u|*u, where |u| = sqrt(2*KE) = 
+         !                sqrt(KE1 + KE2) from the neighboring cells
+         velocityMagnitude = sqrt(kineticEnergyCell(minLevelCell(cell1),cell1) &
+                                + kineticEnergyCell(minLevelCell(cell2),cell2))
          landIceEdgeFraction = 0.5_RKIND*(landIceFraction(cell1)+landIceFraction(cell2))
 
          topDrag(iEdge) = - rho_sw * landIceEdgeFraction * config_land_ice_flux_topDragCoeff &
@@ -2716,13 +2751,14 @@ contains
       do iCell = 1, nCellsAll
          ! the magnitude of the top drag is CD*u**2 = CD*(2*KE)
          topDragMag(iCell) = rho_sw * landIceFraction(iCell) &
-                           * 2.0_RKIND * config_land_ice_flux_topDragCoeff *  kineticEnergyCell(minLevelCell(iCell),iCell)
+                           * 2.0_RKIND * config_land_ice_flux_topDragCoeff &
+                           * kineticEnergyCell(minLevelCell(iCell),iCell)
 
          ! the friction velocity is the square root of the top drag + variance of tidal velocity
          ! (computed regardless of land-ice coverage)
          landIceFrictionVelocity(iCell) = sqrt(config_land_ice_flux_topDragCoeff * &
-                                   (2.0_RKIND * kineticEnergyCell(minLevelCell(iCell),iCell) &
-                                   + config_land_ice_flux_rms_tidal_velocity**2))
+                         ( 2.0_RKIND * kineticEnergyCell(minLevelCell(iCell),iCell) &
+                         + config_land_ice_flux_rms_tidal_velocity**2))
       end do
       !$omp end do
 
@@ -2733,10 +2769,14 @@ contains
          blTempScratch(iCell) = 0.0_RKIND
          blSaltScratch(iCell) = 0.0_RKIND
          do iLevel = minLevelCell(iCell), maxLevelCell(iCell)
-            dz = min(layerThickness(iLevel,iCell),config_land_ice_flux_boundaryLayerThickness-blThickness)
+            dz = min(layerThickness(iLevel,iCell), &
+                     config_land_ice_flux_boundaryLayerThickness &
+                   - blThickness)
             if(dz <= 0.0_RKIND) exit
-            blTempScratch(iCell) = blTempScratch(iCell) + activeTracers(indexT, iLevel, iCell)*dz
-            blSaltScratch(iCell) = blSaltScratch(iCell) + activeTracers(indexS, iLevel, iCell)*dz
+            blTempScratch(iCell) = blTempScratch(iCell) &
+                                 + activeTracers(indexT, iLevel, iCell)*dz
+            blSaltScratch(iCell) = blSaltScratch(iCell) &
+                                 + activeTracers(indexS, iLevel, iCell)*dz
             blThickness = blThickness + dz
          end do
          if(blThickness > 0.0_RKIND) then
@@ -2755,13 +2795,22 @@ contains
             do i = 1, nEdgesOnCell(iCell)
                cell2 = cellsOnCell(i,iCell)
 
-               landIceBoundaryLayerTracers(indexBLT, iCell) = landIceBoundaryLayerTracers(indexBLT, iCell) &
-                 + cellMask(minLevelCell(cell2),cell2)*config_land_ice_flux_boundaryLayerNeighborWeight*blTempScratch(cell2)
-               landIceBoundaryLayerTracers(indexBLS, iCell) = landIceBoundaryLayerTracers(indexBLS, iCell) &
-                 + cellMask(minLevelCell(cell2),cell2)*config_land_ice_flux_boundaryLayerNeighborWeight*blSaltScratch(cell2)
-               weightSum = weightSum + cellMask(minLevelCell(cell2),cell2)*config_land_ice_flux_boundaryLayerNeighborWeight
+               landIceBoundaryLayerTracers(indexBLT, iCell) = &
+                      landIceBoundaryLayerTracers(indexBLT, iCell) &
+                    + cellMask(minLevelCell(cell2),cell2) &
+                    * config_land_ice_flux_boundaryLayerNeighborWeight &
+                    * blTempScratch(cell2)
+
+               landIceBoundaryLayerTracers(indexBLS, iCell) = &
+                      landIceBoundaryLayerTracers(indexBLS, iCell) &
+                    + cellMask(minLevelCell(cell2),cell2) &
+                    * config_land_ice_flux_boundaryLayerNeighborWeight &
+                    * blSaltScratch(cell2)
+               weightSum = weightSum + cellMask(minLevelCell(cell2),cell2) &
+                         * config_land_ice_flux_boundaryLayerNeighborWeight
             end do
-            landIceBoundaryLayerTracers(:, iCell) = landIceBoundaryLayerTracers(:, iCell)/weightSum
+            landIceBoundaryLayerTracers(:, iCell) = &
+                  landIceBoundaryLayerTracers(:, iCell) / weightSum
          end if
       end do
       !$omp end do
@@ -2772,10 +2821,12 @@ contains
          !$omp do schedule(runtime)
          do iCell = 1, nCellsAll
             ! transfer coefficients from namelist
-            landIceTracerTransferVelocities(indexHeatTrans, iCell) = landIceFrictionVelocity(iCell) &
-                                             * config_land_ice_flux_jenkins_heat_transfer_coefficient
-            landIceTracerTransferVelocities(indexSaltTrans, iCell) = landIceFrictionVelocity(iCell) &
-                                             * config_land_ice_flux_jenkins_salt_transfer_coefficient
+            landIceTracerTransferVelocities(indexHeatTrans, iCell) = &
+                       landIceFrictionVelocity(iCell) &
+                     * config_land_ice_flux_jenkins_heat_transfer_coefficient
+            landIceTracerTransferVelocities(indexSaltTrans, iCell) = &
+                       landIceFrictionVelocity(iCell) &
+                     * config_land_ice_flux_jenkins_salt_transfer_coefficient
          end do
          !$omp end do
          !$omp end parallel
@@ -2785,18 +2836,22 @@ contains
          do iCell = 1, nCellsAll
             ! friction-velocity dependent non-dimensional transfer coefficients from
             ! Holland and Jenkins 1999, (14)-(16) with eta_* = 1
-            h_nu = 5.0_RKIND*nuSaltWater/landIceFrictionVelocity(iCell) ! uStar should never be zero because of tidal term
+            ! uStar should never be zero because of tidal term
+            h_nu = 5.0_RKIND*nuSaltWater/landIceFrictionVelocity(iCell) 
 
             Gamma_turb = 1.0_RKIND/(2.0_RKIND*xiN) - 1.0_RKIND/kVonKarman
             if(abs(fCell(iCell)) > 0.0_RKIND) then
-              Gamma_turb = Gamma_turb + 1.0_RKIND/kVonKarman*log(landIceFrictionVelocity(iCell) &
-                *xiN/(abs(fCell(iCell))*h_nu))
+              Gamma_turb = Gamma_turb + 1.0_RKIND/kVonKarman &
+                         * log(landIceFrictionVelocity(iCell) &
+                         * xiN/(abs(fCell(iCell))*h_nu))
             end if
 
-            landIceTracerTransferVelocities(indexHeatTrans, iCell) = 1.0_RKIND/(Gamma_turb + 12.5_RKIND &
-                                                                   * Pr**(2.0_RKIND/3.0_RKIND) - 6.0_RKIND)
-            landIceTracerTransferVelocities(indexSaltTrans, iCell) = 1.0_RKIND/(Gamma_turb + 12.5_RKIND &
-                                                                   * Sc**(2.0_RKIND/3.0_RKIND) - 6.0_RKIND)
+            landIceTracerTransferVelocities(indexHeatTrans, iCell) = &
+                           1.0_RKIND/(Gamma_turb + 12.5_RKIND &
+                         * Pr**(2.0_RKIND/3.0_RKIND) - 6.0_RKIND)
+            landIceTracerTransferVelocities(indexSaltTrans, iCell) = 1&
+                           .0_RKIND/(Gamma_turb + 12.5_RKIND &
+                         * Sc**(2.0_RKIND/3.0_RKIND) - 6.0_RKIND)
          end do
          !$omp end do
          !$omp end parallel
@@ -2948,24 +3003,32 @@ contains
          call mpas_pool_get_array(meshPool, 'maxLevelEdgeBot', maxLevelEdgeBot)
          call mpas_pool_get_array(meshPool, 'maxLevelVertexBot', maxLevelVertexBot)
 
-         call mpas_pool_get_array(statePool, 'layerThickness', layerThickness, timeLevel=timeLevelLocal)
-         call mpas_pool_get_array(statePool, 'normalVelocity', normalVelocity, timeLevel=timeLevelLocal)
-         call mpas_pool_get_array(tracersPool, 'activeTracers', activeTracers, timeLevel=timeLevelLocal)
+         call mpas_pool_get_array(statePool, 'layerThickness', layerThickness, &
+                                  timeLevel=timeLevelLocal)
+         call mpas_pool_get_array(statePool, 'normalVelocity', normalVelocity, &
+                                  timeLevel=timeLevelLocal)
+         call mpas_pool_get_array(tracersPool, 'activeTracers', activeTracers, &
+                                  timeLevel=timeLevelLocal)
 
          ! Check for errors in the state fields
          do iCell = 1, nCellsSolve
             do k = minLevelCell(iCell), maxLevelCell(iCell)
-               thickNanFound = thickNanFound .or. ( .not. layerThickness(k, iCell) == layerThickness(k, iCell) )
+               thickNanFound = thickNanFound .or. &
+                             ( .not. layerThickness(k, iCell) &
+                                  == layerThickness(k, iCell) )
                do iTracer = 1, size(activeTracers, dim=1)
                   tracersNanFound = tracersNanFound .or. &
-                                  ( .not. activeTracers(iTracer, k, iCell) == activeTracers(iTracer, k, iCell) )
+                                  ( .not. activeTracers(iTracer, k, iCell) &
+                                       == activeTracers(iTracer, k, iCell) )
                end do
             end do
          end do
 
          do iEdge = 1, nEdgesSolve
             do k = minLevelEdgeTop(iEdge), maxLevelEdgeBot(iEdge)
-               velNanFound = velNanFound .or. ( .not. normalVelocity(k, iEdge) == normalVelocity(k, iEdge) )
+               velNanFound = velNanFound .or. &
+                           ( .not. normalVelocity(k, iEdge) &
+                                == normalVelocity(k, iEdge) )
             end do
          end do
 
@@ -2976,9 +3039,12 @@ contains
             write(debugUnit, *) 'ERROR: NaN Detected in state see below for which field contained a NaN.'
             write(debugUnit, *) '  -- Statistics information for block fields'
 
-            if ( mpas_stream_mgr_stream_exists(domain % streamManager, 'block_.*') ) then
-               call mpas_stream_mgr_block_Write(domain % streamManager, writeBlock=block, streamID='block_.*', &
-                  forceWriteNow=.true.)
+            if ( mpas_stream_mgr_stream_exists(domain % streamManager, &
+                                               'block_.*') ) then
+               call mpas_stream_mgr_block_Write(domain % streamManager, &
+                                                writeBlock=block, &
+                                                streamID='block_.*', &
+                                                forceWriteNow=.true.)
             end if
 
             ! Also, write general block information, like lat/lon bounds
@@ -2992,7 +3058,8 @@ contains
                minValue = min( minValue, real1DArr(iCell) )
                maxValue = max( maxValue, real1DArr(iCell) )
             end do
-            call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+            call ocn_write_field_statistics(debugUnit, fieldName, &
+                                            minValue, maxValue)
 
             ! Test lonCell
             fieldName = 'lonCell'
@@ -3003,7 +3070,8 @@ contains
                minValue = min( minValue, real1DArr(iCell) )
                maxValue = max( maxValue, real1DArr(iCell) )
             end do
-            call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+            call ocn_write_field_statistics(debugUnit, fieldName, &
+                                            minValue, maxValue)
 
             ! Test xCell
             fieldName = 'xCell'
@@ -3014,7 +3082,8 @@ contains
                minValue = min( minValue, real1DArr(iCell) )
                maxValue = max( maxValue, real1DArr(iCell) )
             end do
-            call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+            call ocn_write_field_statistics(debugUnit, fieldName, &
+                                            minValue, maxValue)
 
             ! Test yCell
             fieldName = 'yCell'
@@ -3025,7 +3094,8 @@ contains
                minValue = min( minValue, real1DArr(iCell) )
                maxValue = max( maxValue, real1DArr(iCell) )
             end do
-            call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+            call ocn_write_field_statistics(debugUnit, fieldName, &
+                                            minValue, maxValue)
 
             ! Test zCell
             fieldName = 'zCell'
@@ -3036,7 +3106,8 @@ contains
                minValue = min( minValue, real1DArr(iCell) )
                maxValue = max( maxValue, real1DArr(iCell) )
             end do
-            call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+            call ocn_write_field_statistics(debugUnit, fieldName, &
+                                            minValue, maxValue)
 
             ! Test areaCell
             fieldName = 'areaCell'
@@ -3047,10 +3118,12 @@ contains
                minValue = min( minValue, real1DArr(iCell) )
                maxValue = max( maxValue, real1DArr(iCell) )
             end do
-            call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+            call ocn_write_field_statistics(debugUnit, fieldName, &
+                                            minValue, maxValue)
          end if!}}}
 
-         ! If there was a thickness NaN found, write out information about fields that affect thickness
+         ! If there was a thickness NaN found, write out information 
+         ! about fields that affect thickness
          if ( thickNanFound ) then!{{{
             write(debugUnit, *) ''
             write(debugUnit, *) ''
@@ -3067,7 +3140,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test atmosphericPressure
@@ -3080,7 +3154,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test rainFlux
@@ -3093,7 +3168,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test evaporationFlux
@@ -3106,7 +3182,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test snowFlux
@@ -3119,7 +3196,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test seaIceFreshWaterFlux
@@ -3132,7 +3210,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test iceRunoffFlux
@@ -3145,7 +3224,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test riverRunoffFlux
@@ -3158,11 +3238,13 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
          end if!}}}
 
-         ! If there was a velocity NaN found, write out information about fields that affect velocity
+         ! If there was a velocity NaN found, write out information 
+         ! about fields that affect velocity
          if ( velNanFound ) then!{{{
             write(debugUnit, *) ''
             write(debugUnit, *) ''
@@ -3179,7 +3261,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test atmosphericPressure
@@ -3192,7 +3275,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test windStressZonal
@@ -3205,7 +3289,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test windStressMeridional
@@ -3218,7 +3303,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test surfaceStressMagnitude
@@ -3231,7 +3317,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test surfaceStress
@@ -3244,7 +3331,8 @@ contains
                   minValue = min( minValue, real1DArr(iEdge) )
                   maxValue = max( maxValue, real1DArr(iEdge) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test angleEdge
@@ -3257,11 +3345,13 @@ contains
                   minValue = min( minValue, real1DArr(iEdge) )
                   maxValue = max( maxValue, real1DArr(iEdge) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
          end if!}}}
 
-         ! If there was a tracers NaN found, write out information about fields that affect tracers
+         ! If there was a tracers NaN found, write out information 
+         ! about fields that affect tracers
          if ( tracersNanFound ) then!{{{
             write(debugUnit, *) ''
             write(debugUnit, *) ''
@@ -3278,7 +3368,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test sensibleHeatFlux
@@ -3291,7 +3382,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test longWaveHeatFluxUp
@@ -3304,7 +3396,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test longWaveHeatFluxDown
@@ -3317,7 +3410,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test seaIceHeatFlux
@@ -3330,7 +3424,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test icebergHeatFlux
@@ -3343,7 +3438,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test seaIceFreshWaterFlux
@@ -3356,7 +3452,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test icebergFreshWaterFlux
@@ -3369,7 +3466,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test rainFlux
@@ -3382,7 +3480,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test snowFlux
@@ -3395,7 +3494,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test iceRunoffFlux
@@ -3408,7 +3508,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test riverRunoffFlux
@@ -3421,7 +3522,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test seaIceSalinityFlux
@@ -3434,7 +3536,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
 
             ! Test shortWaveHeatFlux
@@ -3447,7 +3550,8 @@ contains
                   minValue = min( minValue, real1DArr(iCell) )
                   maxValue = max( maxValue, real1DArr(iCell) )
                end do
-               call ocn_write_field_statistics(debugUnit, fieldName, minValue, maxValue)
+               call ocn_write_field_statistics(debugUnit, fieldName, &
+                                               minValue, maxValue)
             end if
          end if!}}}
 
