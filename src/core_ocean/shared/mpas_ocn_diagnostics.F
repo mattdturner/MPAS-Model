@@ -274,7 +274,7 @@ contains
       !$acc update device (tracersSurfaceValue)
 
       !$acc parallel loop gang vector &
-      !$acc          present(normalVelocity, normalVelocitySurfaceLayer)
+      !$acc          present(normalVelocity, normalVelocitySurfaceLayer, minLevelEdgeBot)
       !$omp do schedule(runtime)
       do iEdge = 1, nEdges
          normalVelocitySurfaceLayer(iEdge) = normalVelocity(minLevelEdgeBot(iEdge), iEdge)
@@ -318,7 +318,7 @@ contains
       end if ! full_compute
 
       ! Update the arrays on CPU that were calculated in this routine
-      !$acc update host(layerThickEdge, layerThickness, zMid, zTop, ssh, &
+      !$acc update host(layerThickEdge, zMid, zTop, &
       !$acc             normalVelocitySurfaceLayer, montgomeryPotential, &
       !$acc             tangentialVelocity, relativeVorticityCell, &
       !$acc             divergence, vertVelocityTop, vertTransportVelocityTop, &
@@ -326,8 +326,9 @@ contains
       !$acc             normRelVortEdge, normPlanetVortEdge, pressure, &
       !$acc             normalizedRelativeVorticityCell, surfacePressure)
 
-      !$acc exit data delete (layerThickness, normalVelocity, &
-      !$acc                   activeTracers, ssh, seaIcePressure, &
+      !$acc exit data copyout(layerThickness, ssh)
+      !$acc exit data delete (normalVelocity, &
+      !$acc                   activeTracers, seaIcePressure, &
       !$acc                   atmosphericPressure)
 
       call mpas_timer_stop('diagnostic solve')
@@ -380,6 +381,7 @@ contains
       integer :: iVertex, iEdge, i, k, kmin, kmax
 
       real (kind=RKIND) :: invAreaTri1, r_tmp
+      real (kind=RKIND) :: circ_tmp, vort_tmp
 
       err = 0
 
@@ -398,20 +400,29 @@ contains
 
       !$acc parallel loop gang vector collapse(2) &
       !$acc          present(circulation, relativeVorticity, areaTriangle, edgesOnVertex, &
-      !$acc                  maxLevelVertexBot, dcEdge, normalVelocity, edgeSignOnVertex) &
+      !$acc                  maxLevelVertexBot, dcEdge, normalVelocity, edgeSignOnVertex, &
+      !$acc                  minLevelVertexTop) &
       !$acc          private(invAreaTri1, i, iEdge, k, r_tmp)
       do iVertex = 1, nVerticesAll
          do k = kmin, kmax
+            circ_tmp = 0.0_RKIND
             if ( k >= minLevelVertexTop(iVertex) .and. k <= maxLevelVertexBot(iVertex) ) then
                invAreaTri1 = 1.0_RKIND / areaTriangle(iVertex)
                do i = 1, vertexDegree
                   iEdge = edgesOnVertex(i, iVertex)
                   r_tmp = dcEdge(iEdge) * normalVelocity(k, iEdge)
  
-                  circulation(k, iVertex) = circulation(k, iVertex) + edgeSignOnVertex(i, iVertex) * r_tmp
-                  relativeVorticity(k, iVertex) = relativeVorticity(k, iVertex) + edgeSignOnVertex(i, iVertex) * r_tmp * invAreaTri1
+                  !circulation(k, iVertex) = circulation(k, iVertex) &
+                  circ_tmp = circ_tmp &
+                                          + edgeSignOnVertex(i, iVertex) &
+                                          * r_tmp
+                  relativeVorticity(k, iVertex) = &
+                              relativeVorticity(k, iVertex) &
+                            + edgeSignOnVertex(i, iVertex) * r_tmp &
+                            * invAreaTri1
                end do
             end if
+            circulation(k, iVertex) = circ_tmp
          end do
       end do
 #else
@@ -482,6 +493,7 @@ contains
       !-----------------------------------------------------------------
 
       integer :: iEdge, k, cell1, cell2, nEdges
+      integer :: kmin, kmax
 
       !
       ! Compute height on cell edges at velocity locations
@@ -492,10 +504,35 @@ contains
 
       if (.not. config_use_wetting_drying .or. (config_use_wetting_drying &
           .and. (trim(config_thickness_flux_type) .eq. 'centered'))) then
-        !$acc parallel loop gang &
+#ifdef MPAS_OPENACC
+        kmin = minval(minLevelEdgeBot)
+        kmax = maxval(maxLevelEdgeTop)
+
+        !$acc parallel loop gang vector collapse(2) &
+        !$acc          present(layerThicknessEdge) &
+        !$acc          private(k)
+        do iEdge = 1, nEdges
+          do k = 1, nVertLevels
+            ! initialize layerThicknessEdge to avoid divide by zero and NaN problems.
+            layerThicknessEdge(k, iEdge) = -1.0e34_RKIND
+          end do
+        end do
+
+        !$acc parallel loop gang vector collapse(2) &
         !$acc          present(layerThicknessEdge, cellsOnEdge, minLevelEdgeBot, &
         !$acc                  maxLevelEdgeTop, layerThickness) &
         !$acc          private(cell1, cell2, k)
+        do iEdge = 1, nEdges
+          do k = kmin, kmax
+            if ( k >= minLevelEdgeBot(iEdge) .and. k <=  maxLevelEdgeTop(iEdge) ) then
+              cell1 = cellsOnEdge(1,iEdge)
+              cell2 = cellsOnEdge(2,iEdge)
+              ! central differenced
+              layerThicknessEdge(k,iEdge) = 0.5_RKIND * (layerThickness(k,cell1) + layerThickness(k,cell2))
+            end if
+          end do
+        end do
+#else
         !$omp parallel
         !$omp do schedule(runtime) private(cell1, cell2, k)
         do iEdge = 1, nEdges
@@ -510,13 +547,46 @@ contains
         end do
         !$omp end do
         !$omp end parallel
+#endif
       else
         if (config_use_wetting_drying .and. (trim(config_thickness_flux_type) .ne. 'centered')) then
           if ( trim(config_thickness_flux_type) .eq. 'upwind') then
-            !$acc parallel loop gang &
+#ifdef MPAS_OPENACC
+            kmin = minval(minLevelEdgeBot)
+            kmax = maxval(maxLevelEdgeTop)
+    
+            !$acc parallel loop gang vector collapse(2) &
+            !$acc          present(layerThicknessEdge) &
+            !$acc          private(k)
+            do iEdge = 1, nEdges
+              do k = 1, nVertLevels
+                ! initialize layerThicknessEdge to avoid divide by zero and NaN problems.
+                layerThicknessEdge(k, iEdge) = -1.0e34_RKIND
+              end do
+            end do
+
+            !$acc parallel loop gang vector collapse(2) &
             !$acc          present(layerThicknessEdge, cellsOnEdge, minLevelEdgeBot, &
             !$acc                  maxLevelEdgeTop, layerThickness, normalVelocity) &
             !$acc          private(cell1, cell2, k)
+            do iEdge = 1, nEdges
+              do k = kmin, kmax
+                if ( k >= minLevelEdgeBot(iEdge) .and. k <= maxLevelEdgeTop(iEdge) ) then
+                  cell1 = cellsOnEdge(1,iEdge)
+                  cell2 = cellsOnEdge(2,iEdge)
+                  ! upwind
+                  if (normalVelocity(k, iEdge) > 0.0_RKIND) then
+                    layerThicknessEdge(k,iEdge) = layerThickness(k,cell1)
+                  elseif (normalVelocity(k, iEdge) < 0.0_RKIND) then
+                    layerThicknessEdge(k,iEdge) = layerThickness(k,cell2)
+                  else
+                    layerThicknessEdge(k,iEdge) = max(layerThickness(k,cell1), &
+                                                      layerThickness(k,cell2))
+                  end if
+                end if
+              end do
+            end do
+#else
             !$omp parallel
             !$omp do schedule(runtime) private(cell1, cell2, k)
             do iEdge = 1, nEdges
@@ -537,9 +607,12 @@ contains
             end do
             !$omp end do
             !$omp end parallel
+#endif
           end if
         else
-          call mpas_log_write('Thickness flux option of ' // trim(config_thickness_flux_type) // 'is not known', MPAS_LOG_CRIT)
+          call mpas_log_write('Thickness flux option of ' // &
+                               trim(config_thickness_flux_type) // &
+                               'is not known', MPAS_LOG_CRIT)
         end if
       end if
 
@@ -589,6 +662,7 @@ contains
       real (kind=RKIND) :: r_tmp, invAreaCell1
       real (kind=RKIND), parameter :: fiveEighths = 5.0_RKIND / 8.0_RKIND
       real (kind=RKIND), parameter :: threeEighths = 3.0_RKIND / 8.0_RKIND
+      real (kind=RKIND) :: ke_tmp
 
       ! Scratch Arrays
       ! kineticEnergyVertex: kinetic energy of horizontal velocity defined at vertices
@@ -610,16 +684,17 @@ contains
       !$acc parallel loop gang vector collapse(2) &
       !$acc          present(kineticEnergyVertex, edgesOnVertex, dcEdge, dvEdge, &
       !$acc                  areaTriangle, normalVelocity) &
-      !$acc          private(i, iEdge, r_tmp, k)
+      !$acc          private(i, iEdge, r_tmp, k, ke_tmp)
       do iVertex = 1, nVertices
         do k = 1, nVertLevels
-          kineticEnergyVertex(k, iVertex) = 0.0_RKIND
+          ke_tmp = 0.0_RKIND
           do i = 1, vertexDegree
             iEdge = edgesOnVertex(i, iVertex)
             r_tmp = dcEdge(iEdge) * dvEdge(iEdge) * 0.25_RKIND / areaTriangle(iVertex)
-            kineticEnergyVertex(k, iVertex) = kineticEnergyVertex(k, iVertex) + r_tmp &
-                                            * normalVelocity(k, iEdge)**2
+            ke_tmp = ke_tmp + r_tmp &
+                   * normalVelocity(k, iEdge)**2
           end do
+          kineticEnergyVertex(k, iVertex) = ke_tmp
         end do
       end do
 #else
@@ -646,15 +721,16 @@ contains
       !$acc          private(invAreaCell1, i, j, iVertex, k)
       do iCell = 1, nCells
         do k = 1, nVertLevels
-          kineticEnergyVertexOnCells(k, iCell) = 0.0_RKIND
           invAreaCell1 = invAreaCell(iCell)
+          ke_tmp = 0.0_RKIND
           do i = 1, nEdgesOnCell(iCell)
             j = kiteIndexOnCell(i, iCell)
             iVertex = verticesOnCell(i, iCell)
-            kineticEnergyVertexOnCells(k, iCell) = kineticEnergyVertexOnCells(k, iCell) &
-                                                 + kiteAreasOnVertex(j, iVertex) &
-                                                 * kineticEnergyVertex(k, iVertex) * invAreaCell1
+            ke_tmp = ke_tmp&
+                   + kiteAreasOnVertex(j, iVertex) &
+                   * kineticEnergyVertex(k, iVertex) * invAreaCell1
           end do
+          kineticEnergyVertexOnCells(k, iCell) = ke_tmp
         end do
       end do
 #else
@@ -754,6 +830,7 @@ contains
       integer :: vertex1, vertex2, cell1, cell2
       real(kind=RKIND) :: invAreaTri1, invAreaCell1, invLength
       real(kind=RKIND) :: layerThicknessVertex
+      real(kind=RKIND) :: sum_tmp
       integer :: kmin, kmax
 
       ! normalizedPlanetaryVorticityVertex: earth's rotational rate (Coriolis parameter, f)
@@ -842,7 +919,8 @@ contains
       !$acc                  normalizedPlanetaryVorticityEdge, &
       !$acc                  verticesOnEdge, maxLevelEdgeBot, &
       !$acc                  normalizedRelativeVorticityVertex, &
-      !$acc                  normalizedPlanetaryVorticityVertex) &
+      !$acc                  normalizedPlanetaryVorticityVertex, &
+      !$acc                  minLevelEdgeTop) &
       !$acc          private(vertex1, vertex2, k)
       do iEdge = 1, nEdges
         do k = kmin, kmax
@@ -887,21 +965,24 @@ contains
       !$acc parallel loop gang vector &
       !$acc          present(normalizedRelativeVorticityCell, maxLevelCell, nEdgesOnCell, &
       !$acc                  areaCell, kiteIndexOnCell, verticesOnCell, kiteAreasOnVertex, &
-      !$acc                  invAreaCell) &
-      !$acc          private(invAreaCell1, i, j, iVertex, k)
+      !$acc                  invAreaCell, minLevelCell, normalizedRelativeVorticityVertex) &
+      !$acc          private(invAreaCell1, i, j, iVertex, k, sum_tmp)
       do iCell = 1, nCells
         do k = kmin, kmax
-          normalizedRelativeVorticityCell(k, iCell) = 0.0_RKIND
+          sum_tmp = 0.0_RKIND
           if ( k >= minLevelCell(iCell) .and. k <=  maxLevelCell(iCell) ) then
             invAreaCell1 = invAreaCell(iCell)
 
             do i = 1, nEdgesOnCell(iCell)
               j = kiteIndexOnCell(i, iCell)
               iVertex = verticesOnCell(i, iCell)
-              normalizedRelativeVorticityCell(k, iCell) = normalizedRelativeVorticityCell(k, iCell) &
-                + kiteAreasOnVertex(j, iVertex) * normalizedRelativeVorticityVertex(k, iVertex) * invAreaCell1
+              sum_tmp = sum_tmp &
+                      + kiteAreasOnVertex(j, iVertex) &
+                      * normalizedRelativeVorticityVertex(k, iVertex) &
+                      * invAreaCell1
             end do
           end if
+          normalizedRelativeVorticityCell(k, iCell) = sum_tmp
         end do
       end do
 #else
@@ -945,9 +1026,10 @@ contains
          !$acc                  normalizedRelativeVorticityCell, dvEdge, &
          !$acc                  vorticityGradientTangentialComponent, &
          !$acc                  normalizedRelativeVorticityVertex) &
-         !$acc          private(cell1, cell2, vertex1, vertex2, invLength, k)
+         !$acc          private(cell1, cell2, vertex1, vertex2, invLength, k, kmin, kmax)
          !$omp parallel
-         !$omp do schedule(runtime) private(cell1, cell2, vertex1, vertex2, invLength, k)
+         !$omp do schedule(runtime) private(cell1, cell2, vertex1, vertex2, &
+         !$omp                              invLength, k, kmin, kmax)
          do iEdge = 1,nEdges
             cell1 = cellsOnEdge(1, iEdge)
             cell2 = cellsOnEdge(2, iEdge)
@@ -955,18 +1037,22 @@ contains
             vertex2 = verticesOnedge(2, iEdge)
 
             invLength = 1.0_RKIND / dcEdge(iEdge)
+            kmin = minLevelEdgeBot(iEdge)
+            kmax = maxLevelEdgeTop(iEdge)
             ! Compute gradient of PV in normal direction
             !   ( this computes the gradient for all edges bounding real cells )
-            do k = minLevelEdgeBot(iEdge), maxLevelEdgeTop(iEdge)
+            do k = kmin, kmax
                vorticityGradientNormalComponent(k,iEdge) = &
                       (normalizedRelativeVorticityCell(k,cell2) &
                      - normalizedRelativeVorticityCell(k,cell1)) * invLength
             enddo
 
             invLength = 1.0_RKIND / dvEdge(iEdge)
+            kmin = minLevelEdgeTop(iEdge)
+            kmax = maxLevelEdgeBot(iEdge)
             ! Compute gradient of PV in the tangent direction
             !   ( this computes the gradient at all edges bounding real cells and distance-1 ghost cells )
-            do k = minLevelEdgeTop(iEdge), maxLevelEdgeBot(iEdge)
+            do k = kmin, kmax
               vorticityGradientTangentialComponent(k,iEdge) = &
                      (normalizedRelativeVorticityVertex(k,vertex2) &
                     - normalizedRelativeVorticityVertex(k,vertex1)) * invLength
@@ -978,12 +1064,27 @@ contains
          !
          ! Modify PV edge with upstream bias.
          !
+#ifdef MPAS_OPENACC
+         kmin = minval(minLevelEdgeTop)
+         kmax = maxval(maxLevelEdgeBot)
          !$acc parallel loop gang &
          !$acc          present(minLevelEdgeTop, maxLevelEdgeBot, normalVelocity, &
          !$acc                  normalizedRelativeVorticityEdge, tangentialVelocity, &
          !$acc                  vorticityGradientNormalComponent, config_apvm_scale_factor, &
          !$acc                  vorticityGradientTangentialComponent) &
          !$acc          private(k)
+         do iEdge = 1,nEdges
+            do k = kmin, kmax
+              if ( k >= minLevelEdgeTop(iEdge) .and. k <= maxLevelEdgeBot(iEdge) ) then
+                normalizedRelativeVorticityEdge(k,iEdge) = normalizedRelativeVorticityEdge(k,iEdge) &
+                  - config_apvm_scale_factor * dt * &
+                   (  normalVelocity(k,iEdge)     * vorticityGradientNormalComponent(k,iEdge)      &
+                    + tangentialVelocity(k,iEdge) * vorticityGradientTangentialComponent(k,iEdge) )
+              end if
+            end do
+         enddo
+         !$acc update host(normalizedRelativeVorticityVertex)
+#else
          !$omp do schedule(runtime) private(k)
          do iEdge = 1,nEdges
             do k = minLevelEdgeTop(iEdge), maxLevelEdgeBot(iEdge)
@@ -993,9 +1094,9 @@ contains
                      + tangentialVelocity(k,iEdge) * vorticityGradientTangentialComponent(k,iEdge) )
             end do
          enddo
-         !$acc update host(normalizedRelativeVorticityVertex)
          !$omp end do
          !$omp end parallel
+#endif
 
          !$acc exit data delete(vorticityGradientNormalComponent, &
          !$acc                  vorticityGradientTangentialComponent)
@@ -1078,7 +1179,8 @@ contains
       kmax = maxval(maxLevelCell)
 
       !$acc parallel loop gang vector collapse(2) &
-      !$acc          present(BruntVaisalaFreqTop, displacedDensity, density, zMid, maxLevelCell) &
+      !$acc          present(BruntVaisalaFreqTop, displacedDensity, density, &
+      !$acc                  zMid, maxLevelCell, minLevelCell) &
       !$acc          private(k)
       do iCell = 1, nCellsAll
          do k = kmin, kmax
@@ -1117,7 +1219,7 @@ contains
       !$acc update device(edgeAreaFractionOfCell)
       !$acc parallel loop gang vector collapse(2) &
       !$acc          present(RiTopOfCell, maxLevelCell, nEdgesOnCell, edgesOnCell, normalVelocity, &
-      !$acc                  edgeAreaFractionOfCell, zMid, BruntVaisalaFreqTop) &
+      !$acc                  edgeAreaFractionOfCell, zMid, BruntVaisalaFreqTop, minLevelCell) &
       !$acc          private(k, i, iEdge, delU2, shearSquared, shearMean)
       do iCell=1,nCells
          do k = kmin, kmax
@@ -1230,7 +1332,8 @@ contains
       integer :: cell1, cell2
       real(kind=RKIND) :: surfaceLayerDepth
       real(kind=RKIND) :: sumSurfaceLayer
-      integer :: kmin, kmax
+      integer :: kmin, kmax, numSurfLay
+      real(kind=RKIND) :: sumVelSurf
 
       !
       ! average tracer values over the ocean surface layer
@@ -1242,10 +1345,11 @@ contains
 #ifdef MPAS_OPENACC
         kmin = minval(minLevelCell)
         kmax = maxval(maxLevelCell)
+        numSurfLay = size(tracersSurfaceLayerValue,1)
 
         !$acc parallel loop gang vector &
         !$acc          present(tracersSurfaceLayerValue, indexSurfaceLayerDepth, maxLevelCell, &
-        !$acc                  layerThickness, activeTracers) &
+        !$acc                  layerThickness, activeTracers, minLevelCell) &
         !$acc          private(sumSurfaceLayer, k, rSurfaceLayer)
         do iCell=1,nCells
           sumSurfaceLayer=0.0_RKIND
@@ -1323,7 +1427,7 @@ contains
 
         !$acc parallel loop gang vector &
         !$acc          present(normalVelocitySurfaceLayer, cellsOnEdge, maxLevelEdgeTop, &
-        !$acc                  layerThicknessEdge, normalVelocity) &
+        !$acc                  layerThicknessEdge, normalVelocity, minLevelEdgeBot) &
         !$acc          private(cell1, cell2, rSurfaceLayer, sumSurfaceLayer, k)
         !$omp parallel
         !$omp do schedule(runtime) private(cell1, cell2, sumSurfaceLayer, k, rSurfaceLayer)
@@ -1343,12 +1447,13 @@ contains
                  exit
               endif
            end do
-           normalVelocitySurfaceLayer(iEdge) = 0.0_RKIND
+           sumVelSurf = 0.0_RKIND
            do k = minLevelEdgeBot(iEdge),int(rSurfaceLayer)
-              normalVelocitySurfaceLayer(iEdge) = normalVelocitySurfaceLayer(iEdge) &
-                                                + normalVelocity(k,iEdge) &
-                                                * layerThicknessEdge(k,iEdge)
+              sumVelSurf = sumVelSurf &
+                         + normalVelocity(k,iEdge) &
+                         * layerThicknessEdge(k,iEdge)
            end do
+           normalVelocitySurfaceLayer(iEdge) = sumVelSurf
            k=int(rSurfaceLayer)+1
            if(k.le.maxLevelEdgeTop(iEdge)) then
               normalVelocitySurfaceLayer(iEdge) = (normalVelocitySurfaceLayer(iEdge) &
@@ -1458,6 +1563,13 @@ contains
 
 #ifdef MPAS_OPENACC
       real (kind=RKIND), dimension(:,:), allocatable:: div_hu,div_huTransport,div_huGMBolus
+      real (kind=RKIND) :: relVortSum
+      real (kind=RKIND) :: divergenceSum
+      real (kind=RKIND) :: transportSum
+      real (kind=RKIND) :: kineticEnergySum
+      real (kind=RKIND) :: bolusSum
+      real (kind=RKIND) :: huSum
+      real (kind=RKIND) :: tanVelSum
 #else
       real (kind=RKIND), dimension(:), allocatable:: div_hu,div_huTransport,div_huGMBolus
 #endif
@@ -1471,23 +1583,25 @@ contains
       !$acc parallel loop gang vector collapse(2) &
       !$acc          present(relativeVorticityCell, areaCell, nEdgesOnCell, &
       !$acc                  kiteIndexOnCell, verticesOnCell, maxLevelCell, &
-      !$acc                  relativeVorticity, kiteAreasOnVertex, invAreaCell) &
-      !$acc          private(invAreaCell1, i, j, iVertex, k)
+      !$acc                  relativeVorticity, kiteAreasOnVertex, invAreaCell, &
+      !$acc                  minLevelCell) &
+      !$acc          private(invAreaCell1, i, j, iVertex, k, relVortSum)
       do iCell = 1, nCells
         do k = kmin, kmax
-          relativeVorticityCell(k,iCell) = 0.0_RKIND
+          relVortSum = 0.0_RKIND
           if ( k >= minLevelCell(iCell) .and. k <= maxLevelCell(iCell) ) then
             invAreaCell1 = invAreaCell(iCell)
 
             do i = 1, nEdgesOnCell(iCell)
               j = kiteIndexOnCell(i, iCell)
               iVertex = verticesOnCell(i, iCell)
-              relativeVorticityCell(k, iCell) = relativeVorticityCell(k, iCell) &
-                                              + kiteAreasOnVertex(j, iVertex) &
-                                              * relativeVorticity(k, iVertex) &
-                                              * invAreaCell1
+              relVortSum = relVortSum &
+                         + kiteAreasOnVertex(j, iVertex) &
+                         * relativeVorticity(k, iVertex) &
+                         * invAreaCell1
             end do
           end if
+          relativeVorticityCell(k,iCell) = relVortSum
         end do
       end do
 #else
@@ -1525,28 +1639,22 @@ contains
       kmax = maxval(maxLevelCell)
 
       !$acc enter data create(div_hu, div_huTransport, div_huGMBolus)
-      !$acc parallel loop gang vector collapse(2) &
-      !$acc          present(div_hu,div_huTransport,div_huGMBolus)
-      do iCell = 1, nCells
-         do k = 1,nVertLevels
-            div_hu(k,iCell) = 0.0_RKIND
-            div_huTransport(k,iCell) = 0.0_RKIND
-            div_huGMBolus(k,iCell) = 0.0_RKIND
-         end do
-      end do
 
       !$acc parallel loop gang vector collapse(2) &
       !$acc          present(divergence, kineticEnergyCell, div_hu, div_huTransport, div_huGMBolus, &
       !$acc                  areaCell, nEdgesOnCell, edgesOnCell, edgeSignOnCell, dcEdge, dvEdge, &
       !$acc                  maxLevelCell, normalVelocity, divergence, layerThicknessEdge, &
       !$acc                  normalTransportVelocity, normalGMBolusVelocity, &
-      !$acc                  invAreaCell) &
+      !$acc                  invAreaCell, minLevelCell) &
       !$acc          private(invAreaCell1, i, iEdge, edgeSignOnCell_temp, dcEdge_temp, &
       !$acc                  dvEdge_temp, k, r_tmp)
       do iCell = 1, nCells
          do k = kmin, kmax
-            divergence(k, iCell) = 0.0_RKIND
-            kineticEnergyCell(k, iCell) = 0.0_RKIND
+            divergenceSum = 0.0_RKIND
+            transportSum = 0.0_RKIND
+            kineticEnergySum = 0.0_RKIND
+            huSum = 0.0_RKIND
+            bolusSum = 0.0_RKIND
             if ( k >= minLevelCell(iCell) .and. k <=  maxLevelCell(iCell) ) then
                invAreaCell1 = invAreaCell(iCell)
                do i = 1, nEdgesOnCell(iCell)
@@ -1556,27 +1664,33 @@ contains
                   dvEdge_temp = dvEdge(iEdge)
                   r_tmp = dvEdge_temp * normalVelocity(k, iEdge) * invAreaCell1
 
-                  divergence(k, iCell) = divergence(k, iCell) - edgeSignOnCell_temp * r_tmp
-                  div_hu(k, iCell) = div_hu(k, iCell) - layerThicknessEdge(k, iEdge) &
-                                   * edgeSignOnCell_temp * r_tmp
-                  kineticEnergyCell(k, iCell) = kineticEnergyCell(k, iCell) &
-                                                + 0.25 * r_tmp * dcEdge_temp * normalVelocity(k,iEdge)
+                  divergenceSum = divergenceSum - edgeSignOnCell_temp * r_tmp
+                  huSum = huSum - layerThicknessEdge(k, iEdge) &
+                        * edgeSignOnCell_temp * r_tmp
+                  kineticEnergySum = kineticEnergySum &
+                                   + 0.25 * r_tmp * dcEdge_temp * normalVelocity(k,iEdge)
                   ! Compute vertical velocity from the horizontal total transport
-                  div_huTransport(k, iCell) = div_huTransport(k, iCell) &
-                                     - layerThicknessEdge(k, iEdge) * edgeSignOnCell_temp &
-                                     * dvEdge_temp * normalTransportVelocity(k, iEdge) * invAreaCell1
+                  transportSum = transportSum &
+                               - layerThicknessEdge(k, iEdge) * edgeSignOnCell_temp &
+                               * dvEdge_temp * normalTransportVelocity(k, iEdge) * invAreaCell1
                   ! Compute vertical velocity from the horizontal GM Bolus velocity
-                  div_huGMBolus(k, iCell) = div_huGMBolus(k, iCell) &
-                                   - layerThicknessEdge(k, iEdge) * edgeSignOnCell_temp * dvEdge_temp &
-                                   * normalGMBolusVelocity(k, iEdge) * invAreaCell1
+                  bolusSum = bolusSum &
+                           - layerThicknessEdge(k, iEdge) * edgeSignOnCell_temp * dvEdge_temp &
+                           * normalGMBolusVelocity(k, iEdge) * invAreaCell1
                end do
             end if
+            divergence(k, iCell) = divergenceSum
+            kineticEnergyCell(k, iCell) = kineticEnergySum
+            div_huTransport(k,iCell) = transportSum
+            div_hu(k, iCell) = huSum
+            div_huGMBolus(k,iCell) = bolusSum
          end do
       end do
 
       !$acc parallel loop gang &
-      !$acc          present(vertVelocityTop,vertTransportVelocityTop,vertGMBolusVelocityTop, &
-      !$acc                  maxLevelCell,div_hu,div_huTransport,div_huGMBolus) &
+      !$acc          present(vertVelocityTop, vertTransportVelocityTop, &
+      !$acc                  vertGMBolusVelocityTop, maxLevelCell, div_hu, &
+      !$acc                  div_huTransport, div_huGMBolus, minLevelCell) &
       !$acc          private(k)
       do iCell = 1, nCells
          ! Vertical velocity at bottom (maxLevelCell(iCell)+1) is zero, initialized above.
@@ -1649,7 +1763,7 @@ contains
       kmax = maxval(maxLevelEdgeBot)
       !$acc parallel loop gang vector collapse(2) &
       !$acc          present(tangentialVelocity, nEdgesOnEdge, edgesOnEdge, weightsOnEdge, &
-      !$acc                  maxLevelEdgeTop, normalVelocity) &
+      !$acc                  maxLevelEdgeTop, normalVelocity, minLevelEdgeBot) &
       !$acc          private(i, eoe, weightsOnEdge_temp, k)
       do iEdge = 1, nEdges
          do k = kmin, kmax
@@ -1744,23 +1858,76 @@ contains
 
       nCells = nCellsAll
 
-      !$acc parallel loop gang &
-      !$acc          present(surfacePressure, atmosphericPressure, seaIcePressure, &
-      !$acc                  frazilSurfacePressure, landIcePressure)
-      !$omp parallel
-      !$omp do schedule(runtime)
-      do iCell = 1, nCells
-         ! Pressure for generalized coordinates.
-         ! Pressure at top surface may be due to atmospheric pressure, frazil
-         ! ice, sea ice or the weight of an ice shelf
-         surfacePressure(iCell) = atmosphericPressure(iCell) + seaIcePressure(iCell)
-         if ( associated(frazilSurfacePressure) ) &
-            surfacePressure(iCell) = surfacePressure(iCell) + frazilSurfacePressure(iCell)
-         if ( associated(landIcePressure) ) &
-            surfacePressure(iCell) = surfacePressure(iCell) + landIcePressure(iCell)
-      end do
-      !$omp end do
-      !$omp end parallel
+!      !$acc parallel loop gang &
+!      !$acc          present(surfacePressure, atmosphericPressure, seaIcePressure, &
+!      !$acc                  frazilSurfacePressure, landIcePressure)
+!      !$omp parallel
+!      !$omp do schedule(runtime)
+!      do iCell = 1, nCells
+!         ! Pressure for generalized coordinates.
+!         ! Pressure at top surface may be due to atmospheric pressure, frazil
+!         ! ice, sea ice or the weight of an ice shelf
+!         surfacePressure(iCell) = atmosphericPressure(iCell) + seaIcePressure(iCell)
+!         if ( associated(frazilSurfacePressure) ) &
+!            surfacePressure(iCell) = surfacePressure(iCell) + frazilSurfacePressure(iCell)
+!         if ( associated(landIcePressure) ) &
+!            surfacePressure(iCell) = surfacePressure(iCell) + landIcePressure(iCell)
+!      end do
+!      !$omp end do
+!      !$omp end parallel
+      if ( associated(frazilSurfacePressure) .and. associated(landIcePressure) ) then
+         !$acc parallel loop gang &
+         !$acc          present(surfacePressure, atmosphericPressure, seaIcePressure, &
+         !$acc                  frazilSurfacePressure, landIcePressure)
+         !$omp parallel
+         !$omp do schedule(runtime)
+         do iCell = 1, nCells
+            surfacePressure(iCell) = atmosphericPressure(iCell) &
+                                   + seaIcePressure(iCell) &
+                                   + frazilSurfacePressure(iCell) &
+                                   + landIcePressure(iCell)
+         end do
+         !$omp end do
+         !$omp end parallel
+      else if ( associated(frazilSurfacePressure) ) then
+         !$acc parallel loop gang &
+         !$acc          present(surfacePressure, atmosphericPressure, seaIcePressure, &
+         !$acc                  frazilSurfacePressure)
+         !$omp parallel
+         !$omp do schedule(runtime)
+         do iCell = 1, nCells
+            surfacePressure(iCell) = atmosphericPressure(iCell) &
+                                   + seaIcePressure(iCell) &
+                                   + frazilSurfacePressure(iCell)
+         end do
+         !$omp end do
+         !$omp end parallel
+      else if ( associated(landIcePressure) ) then
+         !$acc parallel loop gang &
+         !$acc          present(surfacePressure, atmosphericPressure, seaIcePressure, &
+         !$acc                  landIcePressure)
+         !$omp parallel
+         !$omp do schedule(runtime)
+         do iCell = 1, nCells
+            surfacePressure(iCell) = atmosphericPressure(iCell) &
+                                   + seaIcePressure(iCell) &
+                                   + landIcePressure(iCell)
+         end do
+         !$omp end do
+         !$omp end parallel
+      else
+         !$acc parallel loop gang &
+         !$acc          present(surfacePressure, atmosphericPressure, seaIcePressure)
+         !$omp parallel
+         !$omp do schedule(runtime)
+         do iCell = 1, nCells
+            surfacePressure(iCell) = atmosphericPressure(iCell) &
+                                   + seaIcePressure(iCell)
+         end do
+         !$omp end do
+         !$omp end parallel
+      end if
+    
 
    end subroutine ocn_diagnostic_solve_surface_pressure!}}}
 
@@ -2203,7 +2370,7 @@ contains
       !$acc parallel loop &
       !$acc          present(div_hu, invAreaCell, nEdgesOnCell, edgesOnCell, maxLevelEdgeTop, &
       !$acc                  layerThicknessEdge, normalVelocity, dvEdge, edgeSignOnCell, &
-      !$acc                  oldSSH, projectedSSH) &
+      !$acc                  oldSSH, projectedSSH, minLevelEdgeBot) &
       !$acc          private(div_hu_btr, invAreaCell1, i, iEdge, flux, k, kmin, kmax)
       !$omp parallel
       !$omp do schedule(runtime) private(invAreaCell1, i, iEdge, k, flux, div_hu_btr, kmin, kmax)
@@ -2252,7 +2419,7 @@ contains
 
       !$acc parallel loop gang vector &
       !$acc          present(vertAleTransportTop, maxLevelCell, div_hu, ALE_Thickness, &
-      !$acc                  oldLayerThickness) &
+      !$acc                  oldLayerThickness, minLevelCell) &
       !$acc          private(k)
       !$omp parallel
       !$omp do schedule(runtime) private(k)
@@ -2296,7 +2463,8 @@ contains
       real (kind=RKIND), dimension(:,:), pointer :: normalVelocity, normalBaroclinicVelocity
 
       integer :: timeLevel
-      integer :: kmin, kmax
+      integer :: kmin, kmax, jmax
+      real(kind=RKIND) :: normVelSum
 
       if (present(timeLevelIn)) then
          timeLevel = timeLevelIn
@@ -2321,22 +2489,25 @@ contains
       kmax = maxval(maxLevelEdgeBot)
 
       !$acc parallel loop gang vector collapse(2) &
-      !$acc          present(cellsOnEdge, maxLevelEdgeTop, normalVelocity, nEdgesOnEdge, &
-      !$acc                  edgesOnEdge, weightsOnEdge, fEdge, normalBaroclinicVelocity) &
-      !$acc          private(cell1, cell2, k, j, eoe)
+      !$acc          present(cellsOnEdge, maxLevelEdgeTop, normalVelocity, &
+      !$acc                  nEdgesOnEdge, edgesOnEdge, weightsOnEdge, fEdge, &
+      !$acc                  normalBaroclinicVelocity, minLevelEdgeBot) &
+      !$acc          private(cell1, cell2, k, j, eoe, jmax, normVelSum)
       do iEdge = 1, nEdgesOwned
          do k = kmin, kmax
             if ( k >= minLevelEdgeBot(iEdge) .and. k <=  maxLevelEdgeTop(iEdge) ) then
                cell1 = cellsOnEdge(1,iEdge)
                cell2 = cellsOnEdge(2,iEdge)
+               jmax = nEdgesOnEdge(iEdge)
 
-               normalVelocity(k,iEdge) = 0.0_RKIND
-               do j = 1,nEdgesOnEdge(iEdge)
+               normVelSum = 0.0_RKIND
+               do j = 1, jmax
                   eoe = edgesOnEdge(j,iEdge)
-                  normalVelocity(k,iEdge) = normalVelocity(k,iEdge) + weightsOnEdge(j,iEdge) &
+                  normVelSum = normVelSum + weightsOnEdge(j,iEdge) &
                                           * normalBaroclinicVelocity(k,eoe) &
                                           * fEdge(eoe)
                end do
+               normalVelocity(k,iEdge) = normVelSum
             end if 
          end do
       end do
